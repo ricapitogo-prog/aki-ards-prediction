@@ -1,0 +1,352 @@
+---
+title: "AKI Feature Engineering — MICE Imputation"
+author: "Rica Pitogo"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 9, fig.height = 5)
+```
+
+## Overview
+
+This notebook performs MICE (Multiple Imputation by Chained Equations) on the
+pre-imputation feature matrix produced by `02_feature_engineering_v3_mice.Rmd`.
+
+**Input:** `feature_matrix_preimputation.rds` — NAs intact, correlated and zero-variance features dropped
+
+**Outputs:**
+- `feature_matrix_imputed_stacked.rds` — all 5 imputed datasets stacked (`.imp` = 1–5); use to train 5 models and average predictions
+- `feature_matrix_mids.rds` — raw `mids` object for pooling-based inference
+
+**Imputation strategy:**
+- `pmm` (predictive mean matching) for all continuous columns with ≤50% missingness
+- `logreg` for binary: `gender`
+- `polyreg` for multi-level factors: `race`, `admission_type`
+- Columns with **>50% missingness** are dropped entirely — too sparse to be useful predictors
+- IDs, timestamps, outcomes, structural zeros, and SOFA-derived columns are excluded from imputation
+
+---
+
+## Libraries
+
+```{r libraries}
+library(tidyverse)
+library(mice)
+library(knitr)
+```
+
+---
+
+## Step 1: Load Pre-Imputation Matrix
+
+```{r load}
+fm <- readRDS("feature_matrix_preimputation.rds")
+
+cat(sprintf("Loaded: %d rows x %d cols\n", nrow(fm), ncol(fm)))
+```
+
+```{r missingness-overview}
+miss_pre <- fm |>
+  summarise(across(everything(), \(x) mean(is.na(x)))) |>
+  pivot_longer(everything(), names_to = "variable", 
+               values_to = "pct_missing") |>
+  mutate(pct_missing = round(pct_missing * 100, 1)) |>
+  filter(pct_missing > 0) |>
+  arrange(desc(pct_missing))
+
+cat(sprintf("%d of %d columns have missing values\n",
+            nrow(miss_pre), ncol(fm)))
+
+miss_pre |>
+  head(20) |>
+  kable(col.names = c("Variable", "% Missing"),
+        caption = "Top 20 columns by missingness (pre-imputation)")
+```
+
+---
+
+## Step 2: Define Imputation Roles
+
+Columns excluded from MICE fall into four categories:
+1. **IDs & timestamps** — not predictors
+2. **Outcomes** — must not be used in imputation model
+3. **Structural zeros** — 0 = "not given/not present" (vasopressors, comorbidities, vaso doses)
+4. **Derived SOFA components** — computed from inputs; impute inputs, not the derived scores
+5. **Count variables (`_n`)** — number of measurements; NA means 0 measurements taken, not missing data
+
+
+```{r define-roles}
+exclude_cols <- c(
+  # IDs and timestamps
+  "stay_id", "subject_id", "hadm_id", "anchor_year",
+  "vent_start", "vent_end", "intime", "admittime", "outtime", "deathtime",
+  
+  # Outcomes
+  "aki_stage2_7d", "time_to_aki_hours", "n_creat_obs_7d",
+  
+  # Structural zeros / flags
+  "vasopressor_24h",
+  "total_fluid_in_24h", "total_fluid_out_24h", "fluid_balance_24h",
+  "dm", "htn", "ckd", "copd", "hf", "cad", "sepsis",
+  "hospital_expire_flag",
+  
+  # Vasopressor dose rates (0 = not given)
+  grep("^vaso_dose_", names(fm), value = TRUE),
+  
+  # SOFA components (derived; impute inputs instead)
+  grep("^sofa_", names(fm), value = TRUE),
+
+  # Count variables (already zero-filled above; 0 = not measured)
+  grep("_n$", names(fm), value = TRUE)
+)
+
+# Only keep exclude_cols that actually exist in fm
+exclude_cols <- intersect(exclude_cols, names(fm))
+
+impute_cols <- setdiff(names(fm), exclude_cols)
+
+cat(sprintf("Columns to impute: %d\n", length(impute_cols)))
+cat(sprintf("Columns excluded:  %d\n", length(exclude_cols)))
+```
+
+```{r impute-cols-table}
+# How many impute_cols have any missingness?
+miss_impute <- fm |>
+  select(all_of(impute_cols)) |>
+  summarise(across(everything(), \(x) mean(is.na(x)))) |>
+  pivot_longer(everything(), names_to = "variable", 
+               values_to = "pct_missing") |>
+  mutate(pct_missing = round(pct_missing * 100, 1)) |>
+  filter(pct_missing > 0) |>
+  arrange(desc(pct_missing))
+
+cat(sprintf("%d of %d imputable columns have missing values\n",
+            nrow(miss_impute), length(impute_cols)))
+```
+
+---
+
+## Step 3: Drop Sparse and Near-Zero-Variance Columns, Build Predictor Matrix
+
+First drop columns with >50% missingness (too sparse to be useful predictors),
+then drop near-zero-variance columns identified in `03_zero_variance.Rmd`
+exploration (low clinical signal in this mechanically ventilated cohort),
+then build the predictor matrix on the remaining columns.
+
+```{r quickpred}
+fm_for_mice <- fm[, impute_cols]
+
+# Convert character columns to factors for MICE
+fm_for_mice <- fm_for_mice |>
+  mutate(across(where(is.character), as.factor))
+
+# Drop columns with >50% missingness BEFORE quickpred
+pct_miss <- colMeans(is.na(fm_for_mice)) * 100
+drop_cols <- names(pct_miss[pct_miss > 50])
+
+cat(sprintf("%d columns dropped (>50%% missing):\n", length(drop_cols)))
+if (length(drop_cols) > 0) {
+  print(data.frame(variable    = drop_cols,
+                   pct_missing = round(pct_miss[drop_cols], 1)),
+        row.names = FALSE)
+  fm_for_mice <- fm_for_mice |> select(-all_of(drop_cols))
+} else {
+  cat("None.\n")
+}
+cat(sprintf("\nRetained for imputation: %d columns\n", ncol(fm_for_mice)))
+
+# Drop near-zero-variance columns identified in 03_zero_variance.Rmd
+# gcs_verbal_* nearly constant (=1T, intubated); tidal_vol_set_sd mostly 0
+nzv_drop <- c("gcs_verbal_sd", "gcs_verbal_min", "gcs_verbal_mean",
+              "tidal_vol_set_sd")
+nzv_drop <- intersect(nzv_drop, names(fm_for_mice))
+
+cat(sprintf("\n%d near-zero-variance columns dropped: %s\n",
+            length(nzv_drop), paste(nzv_drop, collapse = ", ")))
+
+fm_for_mice <- fm_for_mice |> select(-all_of(nzv_drop))
+cat(sprintf("Retained after NZV filter: %d columns\n", ncol(fm_for_mice)))
+
+# Build predictor matrix on the filtered dataset
+pred_mat <- quickpred(fm_for_mice, mincor = 0.1, minpuc = 0.25)
+
+cat(sprintf("Predictor matrix: %d x %d\n", nrow(pred_mat), ncol(pred_mat)))
+cat(sprintf("Avg predictors per target: %.1f\n", mean(rowSums(pred_mat))))
+```
+
+---
+
+## Step 4: Run MICE
+
+First pass at `maxit = 0` to get the `method` vector, then set methods before
+the full run.
+
+```{r mice-run, cache=TRUE}
+# First pass — just to get the method vector
+mids_init <- mice(fm_for_mice, m = 1, maxit = 0,
+                  predictorMatrix = pred_mat,
+                  printFlag = FALSE)
+
+# Set methods
+meth <- mids_init$method
+meth[names(meth) != ""] <- "pmm" 
+meth["gender"] <- "logreg"
+meth["race"] <- "polyreg"
+meth["admission_type"] <- "polyreg"
+meth[colSums(is.na(fm_for_mice)) == 0] <- ""     
+
+cat("Methods assigned:\n")
+print(meth[meth != ""])
+
+# Final MICE run: m=5 imputations, 10 iterations
+set.seed(203)
+mids_obj <- mice(
+  fm_for_mice,
+  m = 5,
+  method = meth,
+  predictorMatrix = pred_mat,
+  maxit = 10,
+  printFlag = FALSE
+)
+
+cat("\nMICE complete.\n")
+if (!is.null(mids_obj$loggedEvents)) {
+  cat(sprintf("Logged events: %d \n",
+              nrow(mids_obj$loggedEvents)))
+} else {
+  cat("No logged events \n")
+}
+
+# Define here so it's available for Steps 5, 6, and 8
+imputed_cols <- names(meth[meth != ""])
+cat(sprintf("Columns imputed: %d\n", length(imputed_cols)))
+```
+
+---
+
+## Step 5: Convergence Diagnostics
+
+Trace plots show the mean and SD of imputed values across iterations (chains).
+Good mixing = lines that wander without systematic drift.
+
+```{r convergence-plot, fig.height=10, fig.width=12}
+# Select top 8 most-missing variables that were imputed
+top_miss_vars <- miss_impute |>
+  filter(variable %in% imputed_cols) |>
+  slice_max(pct_missing, n = 8) |>
+  pull(variable)
+
+plot(mids_obj, y = top_miss_vars, layout = c(2, length(top_miss_vars)))
+```
+
+---
+
+## Step 6: Validate Distributions
+
+Density overlay: observed data (blue) vs. each of the 5 imputed datasets (red).
+Imputed values should follow a plausible distribution relative to observed.
+
+```{r density-plot, fig.height=8, fig.width=10}
+density_vars <- miss_impute |>
+  filter(variable %in% imputed_cols, pct_missing >= 10) |>
+  slice_max(pct_missing, n = 6) |>
+  pull(variable)
+
+if (length(density_vars) > 0) {
+  fml <- as.formula(paste("~", paste(density_vars, collapse = " + ")))
+  densityplot(mids_obj, fml,
+              main = "Observed (blue) vs. Imputed (red) distributions")
+} else {
+  cat("No variables with ≥10% missingness — skipping density plot.\n")
+}
+```
+
+---
+
+## Step 7: Stack All 5 Imputed Datasets
+
+Re-attach the excluded columns (IDs, outcomes, structural zeros) and stack all 5
+imputations. The `.imp` column (1–5) identifies which imputation each row belongs to.
+
+```{r stack-imputed}
+meta <- fm[, c("stay_id", setdiff(exclude_cols, "stay_id")), drop = FALSE]
+
+feature_matrix_imputed_stacked <- map_dfr(1:5, function(i) {
+  complete(mids_obj, action = i) |>
+    bind_cols(meta) |>
+    mutate(
+      .imp = i,
+      # Recompute sofa_resp from imputed pf_ratio (overwrites pre-MICE NA)
+      sofa_resp = case_when(
+        pf_ratio < 100 ~ 4L, pf_ratio < 200 ~ 3L,
+        pf_ratio < 300 ~ 2L, pf_ratio < 400 ~ 1L,
+        !is.na(pf_ratio) ~ 0L, TRUE ~ NA_integer_
+      )
+    )
+})
+
+# Sanity checks
+stopifnot(nrow(feature_matrix_imputed_stacked) == nrow(fm) * 5)
+stopifnot(all(feature_matrix_imputed_stacked$.imp %in% 1:5))
+
+cat(sprintf("Stacked dataset: %s rows x %d cols (.imp 1–5)\n",
+            format(nrow(feature_matrix_imputed_stacked), big.mark = ","),
+            ncol(feature_matrix_imputed_stacked)))
+```
+
+---
+
+## Step 8: Missingness Confirmation
+
+```{r missingness-check}
+# These should be fully filled (imputed_cols defined in Step 4)
+miss_after <- feature_matrix_imputed_stacked |>
+  filter(.imp == 1) |>
+  summarise(across(all_of(imputed_cols), \(x) sum(is.na(x)))) |>
+  pivot_longer(everything(), names_to = "variable", values_to = "n_missing") |>
+  filter(n_missing > 0)
+
+if (nrow(miss_after) == 0) {
+  cat("All imputed columns are fully filled — no remaining NAs.\n")
+} else {
+  cat(sprintf("WARNING: %d imputed columns still have NAs:\n", 
+              nrow(miss_after)))
+  print(miss_after, row.names = FALSE)
+}
+
+cat(sprintf("\n%d columns were dropped before imputation (>50%% missing).\n",
+            length(drop_cols)))
+
+# Full missingness summary on .imp == 1
+miss_final <- feature_matrix_imputed_stacked |>
+  filter(.imp == 1) |>
+  summarise(across(everything(), \(x) mean(is.na(x)))) |>
+  pivot_longer(everything(), 
+               names_to = "variable", values_to = "pct_missing") |>
+  mutate(pct_missing = round(pct_missing * 100, 1)) |>
+  filter(pct_missing > 0) |>
+  arrange(desc(pct_missing))
+
+if (nrow(miss_final) > 0) {
+  cat(sprintf("\nRemaining NAs post-imputation (%d columns):\n", 
+              nrow(miss_final)))
+  print(miss_final, n = Inf, row.names = FALSE)
+}
+```
+
+---
+
+## Step 9: Save Outputs
+
+```{r save}
+saveRDS(feature_matrix_imputed_stacked, "feature_matrix_imputed_stacked.rds")
+saveRDS(mids_obj, "feature_matrix_mids.rds")
+
+cat(sprintf("Saved feature_matrix_imputed_stacked.rds — %s rows x %d cols\n",
+            format(nrow(feature_matrix_imputed_stacked), big.mark = ","),
+            ncol(feature_matrix_imputed_stacked)))
+cat(sprintf("Saved feature_matrix_mids.rds — mids object (m=5, maxit=10)\n"))
+```

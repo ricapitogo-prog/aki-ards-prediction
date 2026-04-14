@@ -1,0 +1,1099 @@
+---
+title: "AKI Feature Engineering v3 — Column Selection & Pre-Imputation EDA"
+author: "Rica Pitogo"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 9, fig.height = 5)
+```
+
+## Overview
+
+This notebook builds the model-ready feature matrix for predicting AKI Stage 2+
+within 7 days of mechanical ventilation initiation. Patients without historical 
+creatinine data have their baseline imputed via CKD-EPI 2021 at an assumed GFR of 90 mL/min/1.73m².
+
+This version assembles all features first, derives BMI, P/F ratio, and 
+SOFA components, then **selects the 74 candidate predictor columns** for modeling. 
+It outputs a pre-imputation matrix (NAs intact) along with missingness and 
+correlation summaries so columns can be manually reviewed before MICE.
+
+- **Derived features** (BMI, P/F ratio, SOFA components) are computed from observed data before column selection
+
+
+**Inputs**
+
+| File | Description |
+|---|---|
+| `final_cohort_imputed_baseline.rds` | Imputed-baseline cohort (observed + imputed Cr) |
+| `aki_staging_at_intubation_imputed.rds` | Baseline creatinine & AKI stage (v2) |
+| `aki_labs_long.rds` | 61.5M lab measurements |
+| `~/mimic/icu/chartevents.csv.gz` | 3.5 GB — vitals & ventilator settings |
+| `~/mimic/icu/inputevents.csv.gz` | 401 MB — fluid inputs & vasopressors |
+| `~/mimic/icu/outputevents.csv.gz` | 49 MB — fluid outputs |
+| `~/mimic/hosp/diagnoses_icd.csv.gz` | ICD codes for comorbidities |
+| `~/mimic/hosp/admissions.csv.gz` | Race/ethnicity |
+
+**Outputs:**
+- `feature_matrix_preimputation.rds` — 74-column pre-imputation matrix (NAs intact)
+- `feature_missingness_selected.csv` — missingness per selected column
+- `feature_high_correlations.csv` — all pairs with |r| ≥ 0.9
+
+---
+
+## Libraries & Paths
+
+```{r libraries}
+library(tidyverse)
+library(lubridate)
+library(duckdb)
+library(glue)
+library(knitr)
+library(ggcorrplot)
+```
+
+```{r paths}
+mimic_path <- path.expand("~/mimic/")
+```
+
+---
+
+## Load Cohort & Staging Data
+
+```{r load-cohort}
+cohort  <- readRDS("final_cohort_imputed_baseline.rds")
+staging <- readRDS("aki_staging_at_intubation_imputed.rds")
+
+cohort <- cohort %>%
+  left_join(
+    staging %>% select(stay_id, baseline_creat, baseline_source, aki_stage,
+                       max_creat_at_intubation, creat_fold_increase),
+    by = "stay_id"
+  )
+
+cat(sprintf("Cohort: %s stays\n", format(nrow(cohort), big.mark = ",")))
+```
+
+```{r cohort-summary-table}
+cohort %>%
+  count(aki_stage) %>%
+  mutate(pct = round(n / sum(n) * 100, 1)) %>%
+  kable(col.names = c("AKI Stage at Intubation", "N", "%"),
+        caption = "Cohort composition at intubation (before outcome follow-up)")
+```
+
+```{r stay-ids}
+stay_ids_sql <- paste(cohort$stay_id, collapse = ",")
+```
+
+---
+
+## Step 1: Define Outcome — AKI Stage 2+ Within 7 Days
+
+Any creatinine ≥ 2× baseline within 168 hours post-intubation = Stage 2+ event.
+Stays with **no post-intubation creatinine** are coded `NA` (unknown outcome),
+not `0` — missing creatinine does not mean absence of AKI.
+
+```{r labs-load}
+labs_long <- readRDS("aki_labs_long.rds")
+cat(sprintf("Lab rows: %s\n", format(nrow(labs_long), big.mark = ",")))
+```
+
+```{r outcome}
+outcome <- labs_long %>%
+  filter(lab_category == "creatinine", valuenum > 0, valuenum < 20) %>%
+  inner_join(
+    cohort %>% select(subject_id, hadm_id, stay_id, vent_start, baseline_creat),
+    by = c("subject_id", "hadm_id")
+  ) %>%
+  mutate(
+    charttime = parse_date_time(charttime,
+                                orders = c("ymd HMS", "ymd HM", "ymd"),
+                                quiet  = TRUE),
+    hours_from_vent = as.numeric(difftime(charttime, vent_start,
+                                          units = "hours"))
+  ) %>%
+  filter(hours_from_vent > 0, hours_from_vent <= 168) %>%
+  group_by(stay_id) %>%
+  summarise(
+    aki_stage2_7d = as.integer(any(valuenum >= 2.0 * baseline_creat,
+                                       na.rm = TRUE)),
+    time_to_aki_hours = if_else(
+      any(valuenum >= 2.0 * baseline_creat, na.rm = TRUE),
+      min(hours_from_vent[valuenum >= 2.0 * baseline_creat], na.rm = TRUE),
+      NA_real_
+    ),
+    max_creat_7d   = max(valuenum, na.rm = TRUE),
+    n_creat_obs_7d = n(),
+    .groups = "drop"
+  )
+
+# aki_stage2_7d intentionally left NA — missing creatinine = unknown outcome
+outcome <- cohort %>%
+  select(stay_id) %>%
+  left_join(outcome, by = "stay_id") %>%
+  mutate(n_creat_obs_7d = replace_na(n_creat_obs_7d, 0L))
+```
+
+```{r outcome-table}
+outcome %>%
+  mutate(label = case_when(
+    is.na(aki_stage2_7d) ~ "Unknown (no creatinine)",
+    aki_stage2_7d == 1L ~ "AKI Stage 2+ (event)",
+    TRUE ~ "No progression"
+  )) %>%
+  count(label) %>%
+  mutate(pct = round(n / sum(n) * 100, 1)) %>%
+  arrange(desc(n)) %>%
+  kable(col.names = c("Outcome", "N", "%"),
+        caption = "Outcome distribution (7-day AKI Stage 2+ post-intubation)")
+```
+
+```{r outcome-plot}
+outcome %>%
+  mutate(label = case_when(
+    is.na(aki_stage2_7d) ~ "Unknown\n(no creatinine)",
+    aki_stage2_7d == 1L ~ "AKI Stage 2+\n(event)",
+    TRUE ~ "No progression"
+  )) %>%
+  count(label) %>%
+  mutate(pct = round(n / sum(n) * 100, 1)) %>%
+  ggplot(aes(x = reorder(label, -n), y = n, fill = label)) +
+  geom_col(width = 0.6, show.legend = FALSE) +
+  geom_text(aes(label = sprintf("n = %s\n(%.1f%%)", format(n, big.mark=","),
+                                pct)),
+            vjust = -0.4, size = 3.5) +
+  scale_fill_manual(values = c(
+    "AKI Stage 2+\n(event)" = "#e74c3c",
+    "No progression" = "#2ecc71",
+    "Unknown\n(no creatinine)" = "#95a5a6"
+  )) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(title = "7-Day Outcome Distribution — v2 Imputed Baseline",
+       x = NULL, y = "Count") +
+  theme_minimal()
+```
+
+---
+
+## Step 2: 24-Hour Lab Summaries (Observed Only)
+
+Filter `aki_labs_long` to the 0–24h post-intubation window and compute
+observed-only mean/min/max/sd/n per stay × lab combination. NAs are left
+where a lab was not drawn — these will be imputed after manual column review in a later step.
+
+### Filter to 24h window
+
+```{r lab-long}
+# Labs of interest — 24 clinically relevant categories
+labs_of_interest <- c(
+  "bicarbonate", "chloride", "glucose", "hematocrit", "hemoglobin",
+  "inr", "magnesium", "paco2", "pao2", "ph", "platelet", "potassium",
+  "prothrombin", "ptt", "sodium", "troponin", "wbc", "albumin",
+  "bilirubin", "calcium", "lactate", "phosphate", "fibrinogen", "bnp"
+)
+
+lab_long_24h <- labs_long %>%
+  filter(lab_category %in% labs_of_interest) %>%
+  inner_join(
+    cohort %>% select(subject_id, hadm_id, stay_id, vent_start),
+    by = c("subject_id", "hadm_id")
+  ) %>%
+  mutate(
+    charttime = parse_date_time(charttime,
+                                      orders = c("ymd HMS", "ymd HM", "ymd"),
+                                      quiet  = TRUE),
+    hours_from_vent = as.numeric(difftime(charttime, vent_start,
+                                          units = "hours"))
+  ) %>%
+  filter(hours_from_vent >= 0, hours_from_vent < 24, !is.na(valuenum))
+
+rm(labs_long)
+gc()
+```
+
+### Pre-imputation missingness (for reference)
+
+```{r lab-summary-table}
+lab_long_24h %>%
+  group_by(lab_category) %>%
+  summarise(
+    n_obs = n(),
+    n_patients = n_distinct(stay_id),
+    median = round(median(valuenum, na.rm = TRUE), 2),
+    q25 = round(quantile(valuenum, 0.25, na.rm = TRUE), 2),
+    q75 = round(quantile(valuenum, 0.75, na.rm = TRUE), 2),
+    pct_missing = round((1 - n_distinct(stay_id) / nrow(cohort)) * 100, 1)
+  ) %>%
+  arrange(desc(n_patients)) %>%
+  mutate(`Median [IQR]` = sprintf("%.2f [%.2f–%.2f]", median, q25, q75)) %>%
+  select(lab_category, n_patients, `Median [IQR]`, pct_missing) %>%
+  kable(col.names = c("Lab", "Patients with Data", "Median [IQR]", 
+                      "% Missing (pre-MICE)"),
+        caption = "24-hour lab summary — observed data only (before MICE imputation)")
+```
+
+```{r lab-missingness-plot}
+lab_long_24h %>%
+  distinct(stay_id, lab_category) %>%
+  count(lab_category, name = "n_present") %>%
+  mutate(pct_missing = round((1 - n_present / nrow(cohort)) * 100, 1)) %>%
+  arrange(pct_missing) %>%
+  ggplot(aes(x = reorder(lab_category, pct_missing), y = pct_missing)) +
+  geom_col(fill = "#e67e22") +
+  geom_text(aes(label = paste0(pct_missing, "%")), hjust = -0.1, size = 3) +
+  coord_flip() +
+  scale_y_continuous(limits = c(0, 105)) +
+  labs(title = "Lab Missingness in First 24h Post-Intubation (pre-MICE)",
+       x = NULL, y = "% of Cohort Missing") +
+  theme_minimal()
+```
+
+Labs are kept in long format (`lab_long_24h`) and combined with chart events in Step 3a below before aggregation.
+
+---
+
+## Step 3: Chartevents — Respiratory & Hemodynamic (DuckDB)
+
+Extracts 17 key ICU variables from `chartevents.csv.gz`, restricted to the
+first 24 hours post-intubation.
+
+```{r itemid-map}
+itemid_map <- tribble(
+  ~itemid,  ~variable,
+  220339,   "peep_set",
+  224700,   "peep_total",
+  223835,   "fio2",
+  224685,   "tidal_vol_obs",
+  224684,   "tidal_vol_set",
+  224696,   "plateau_pressure",
+  220210,   "resp_rate_obs",
+  224688,   "resp_rate_set",
+  220045,   "heart_rate",
+  220052,   "map_invasive",
+  220181,   "map_noninvasive",
+  220050,   "sbp_invasive",
+  220179,   "sbp_noninvasive",
+  223761,   "temp_f",
+  220277,   "spo2",
+  220739,   "gcs_eye",
+  223900,   "gcs_verbal",
+  223901,   "gcs_motor",
+  226730,   "height_cm",    # time-invariant; extracted separately below
+  226512,   "weight_kg"     # time-invariant; extracted separately below
+)
+
+itemids_sql <- paste(itemid_map$itemid, collapse = ",")
+```
+
+```{r chartevents-query}
+con <- dbConnect(duckdb(), ":memory:")
+
+chart_raw <- dbGetQuery(con, glue("
+  SELECT
+    CAST(stay_id AS INTEGER) AS stay_id,
+    CAST(itemid AS INTEGER) AS itemid,
+    CAST(valuenum AS DOUBLE)  AS valuenum,
+    charttime
+  FROM read_csv_auto('{mimic_path}icu/chartevents.csv.gz',
+                     ignore_errors = true)
+  WHERE itemid IN ({itemids_sql})
+    AND stay_id IN ({stay_ids_sql})
+    AND valuenum IS NOT NULL
+"))
+
+cat(sprintf("Raw chartevents rows: %s\n",
+            format(nrow(chart_raw), big.mark = ",")))
+```
+
+```{r chart-features}
+# Height / Weight (time-invariant; first valid ICU value)
+hw_features <- chart_raw %>%
+  filter(itemid %in% c(226730L, 226512L)) %>%
+  filter(
+    (itemid == 226730L & valuenum >= 100 & valuenum <= 250) |  
+    (itemid == 226512L & valuenum >= 20  & valuenum <= 300)    
+  ) %>%
+  left_join(itemid_map %>% filter(itemid %in% c(226730L, 226512L)),
+            by = "itemid") %>%
+  group_by(stay_id, variable) %>%
+  slice_min(order_by = charttime, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(stay_id, variable, valuenum) %>%
+  pivot_wider(names_from = variable, values_from = valuenum)
+
+hw_features <- cohort %>%
+  select(stay_id) %>%
+  left_join(hw_features, by = "stay_id")
+
+cat(sprintf("Height coverage: %.1f%% | Weight coverage: %.1f%%\n",
+            mean(!is.na(hw_features$height_cm)) * 100,
+            mean(!is.na(hw_features$weight_kg)) * 100))
+
+# Prepare cleaned chartevents (0–24h, excluding height/weight)
+chart_proc <- chart_raw %>%
+  filter(!itemid %in% c(226730L, 226512L)) %>%
+  left_join(itemid_map, by = "itemid") %>%
+  inner_join(cohort %>% select(stay_id, vent_start), by = "stay_id") %>%
+  mutate(
+    charttime = parse_date_time(charttime, orders = c("ymd HMS", "ymd HM"),
+                                quiet  = TRUE),
+    hours_from_vent = as.numeric(difftime(charttime, vent_start,
+                                          units = "hours"))
+  ) %>%
+  filter(hours_from_vent >= 0, hours_from_vent < 24, !is.na(valuenum)) %>%
+  filter(
+    !(variable == "fio2" & (valuenum < 21 | valuenum > 100)),
+    !(variable == "peep_set" & (valuenum < 0 | valuenum > 40)),
+    !(variable == "peep_total" & (valuenum < 0 | valuenum > 40)),
+    !(variable == "tidal_vol_obs" & (valuenum < 50 | valuenum > 1500)),
+    !(variable == "tidal_vol_set" & (valuenum < 50 | valuenum > 1500)),
+    !(variable == "plateau_pressure" & (valuenum < 5 | valuenum > 60)),
+    !(variable == "heart_rate" & (valuenum < 20 | valuenum > 300)),
+    !(variable == "map_invasive" & (valuenum < 20 | valuenum > 200)),
+    !(variable == "map_noninvasive" & (valuenum < 20 | valuenum > 200)),
+    !(variable == "spo2" & (valuenum < 50 | valuenum > 100)),
+    !(variable == "temp_f" & (valuenum < 86 | valuenum > 107.6))
+  )
+
+rm(chart_raw); gc()
+```
+
+---
+
+## Step 3a: Combine Labs + Chart Events → Single Aggregation
+
+Combine `lab_long_24h` (24 lab categories) and `chart_proc` (18 chart variables)
+into one long dataset, then aggregate mean/min/max/sd/n in a single pass.
+
+```{r combine-long}
+combined_long <- bind_rows(
+  lab_long_24h |>
+    select(stay_id, feature = lab_category, value = valuenum),
+  chart_proc |>
+    select(stay_id, feature = variable, value = valuenum)
+)
+
+rm(lab_long_24h, chart_proc); gc()
+
+cat(sprintf("combined_long: %s rows, %d unique features\n",
+            format(nrow(combined_long), big.mark = ","),
+            n_distinct(combined_long$feature)))
+```
+
+```{r features-wide}
+features_wide <- combined_long |>
+  group_by(stay_id, feature) |>
+  summarise(
+    mean = mean(value, na.rm = TRUE),
+    max = max(value, na.rm = TRUE),
+    min = min(value, na.rm = TRUE),
+    sd = sd(value, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  ) |>
+  pivot_wider(
+    names_from = feature,
+    values_from = c(mean, max, min, sd, n),
+    names_glue = "{feature}_{.value}"
+  ) |>
+  mutate(
+    # Derived: prefer peep_total over peep_set
+    peep_mean = coalesce(peep_total_mean, peep_set_mean),
+    # Derived: plateau - PEEP
+    driving_pressure_mean = if_else(
+      !is.na(plateau_pressure_mean) & !is.na(peep_mean),
+      plateau_pressure_mean - peep_mean,
+      NA_real_
+    ),
+    # Derived: prefer invasive MAP
+    map_mean = coalesce(map_invasive_mean, map_noninvasive_mean),
+    # Derived: GCS total (NA if any component is NA)
+    gcs_total_mean = rowSums(
+      cbind(gcs_eye_mean, gcs_verbal_mean, gcs_motor_mean),
+      na.rm = FALSE
+    )
+  )
+
+# Ensure all cohort stays are present (NAs for stays with no data)
+features_wide <- cohort |> select(stay_id) |>
+  left_join(features_wide, by = "stay_id")
+
+rm(combined_long); gc()
+
+cat(sprintf("features_wide: %s stays x %d columns\n",
+            format(nrow(features_wide), big.mark = ","),
+            ncol(features_wide)))
+```
+
+```{r chart-summary-table}
+chart_vars <- list(
+  "PEEP" = features_wide$peep_mean,
+  "FiO2 (%)" = features_wide$fio2_mean,
+  "Tidal Vol obs (mL)" = features_wide$tidal_vol_obs_mean,
+  "Plateau P (cmH2O)" = features_wide$plateau_pressure_mean,
+  "Driving P (cmH2O)" = features_wide$driving_pressure_mean,
+  "RR obs (bpm)" = features_wide$resp_rate_obs_mean,
+  "Heart Rate (bpm)" = features_wide$heart_rate_mean,
+  "MAP (mmHg)" = features_wide$map_mean,
+  "SpO2 (%)" = features_wide$spo2_mean,
+  "Temp (°F)" = features_wide$temp_f_mean,
+  "GCS Total" = features_wide$gcs_total_mean
+)
+
+map_dfr(names(chart_vars), function(nm) {
+  x <- chart_vars[[nm]]
+  tibble(
+    Variable = nm,
+    `Median [IQR]` = sprintf("%.1f [%.1f–%.1f]",
+                              median(x, na.rm = TRUE),
+                              quantile(x, 0.25, na.rm = TRUE),
+                              quantile(x, 0.75, na.rm = TRUE)),
+    `% Missing` = round(mean(is.na(x)) * 100, 1)
+  )
+}) %>%
+  kable(caption = "Key vital signs and ventilator settings — first 24h post-intubation")
+```
+
+```{r chart-boxplot, fig.height=7}
+features_wide %>%
+  left_join(cohort %>% select(stay_id, aki_stage), by = "stay_id") %>%
+  select(aki_stage,
+         PEEP = peep_mean,
+         `FiO2 (%)` = fio2_mean,
+         `MAP (mmHg)` = map_mean,
+         `HR (bpm)` = heart_rate_mean,
+         `Driving P` = driving_pressure_mean,
+         `TV obs (mL)` = tidal_vol_obs_mean) %>%
+  pivot_longer(-aki_stage, names_to = "variable", values_to = "value") %>%
+  filter(!is.na(value), !is.na(aki_stage)) %>%
+  ggplot(aes(x = aki_stage, y = value, fill = aki_stage)) +
+  geom_boxplot(outlier.size = 0.5, outlier.alpha = 0.3) +
+  facet_wrap(~variable, scales = "free_y", ncol = 3) +
+  scale_fill_manual(values = c("No AKI" = "#2ecc71", "Stage 1" = "#f39c12")) +
+  labs(title = "Ventilator & Hemodynamic Settings by AKI Stage (first 24h)",
+       x = NULL, y = NULL, fill = "AKI Stage") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+```{r hw-plot, fig.height=4}
+hw_features %>%
+  select(height_cm, weight_kg) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "value") %>%
+  mutate(variable = recode(variable,
+    "height_cm" = "Height (cm)",
+    "weight_kg" = "Weight (kg)"
+  )) %>%
+  filter(!is.na(value)) %>%
+  ggplot(aes(x = value)) +
+  geom_histogram(bins = 40, fill = "#3498db", color = "white", alpha = 0.85) +
+  facet_wrap(~variable, scales = "free", ncol = 2) +
+  labs(title = "Height and Weight Distributions (pre-MICE)",
+       x = NULL, y = "Count") +
+  theme_minimal()
+```
+
+---
+
+## Step 3b: Comorbidities & Race
+
+Comorbidities are extracted from ICD-9 and ICD-10 codes in the hospital
+diagnoses table. Race is extracted from the admissions table.
+
+```{r comorbidities}
+diagnoses <- read_csv(
+  paste0(mimic_path, "hosp/diagnoses_icd.csv.gz"),
+  col_types = cols(subject_id = col_integer(), hadm_id = col_integer(),
+                   seq_num = col_integer(), icd_code = col_character(),
+                   icd_version = col_integer()),
+  show_col_types = FALSE
+)
+
+comorbidities <- diagnoses %>%
+  filter(hadm_id %in% cohort$hadm_id) %>%
+  mutate(
+    dm = str_starts(icd_code, "250") | str_starts(icd_code, "E1[013]"),
+    htn = str_starts(icd_code, "40[1-5]") | str_starts(icd_code, "I1[0-3]"),
+    ckd = str_starts(icd_code, "585") | str_starts(icd_code, "N18"),
+    copd = str_starts(icd_code, "49[126]") | str_starts(icd_code, "J4[1-4]"),
+    hf = str_starts(icd_code, "428") | str_starts(icd_code, "I50"),
+    cad = str_starts(icd_code, "41[0-4]") | str_starts(icd_code, "I2[0-5]"),
+    sepsis = str_starts(icd_code, "038") | str_starts(icd_code, "9959[12]") |
+             str_starts(icd_code, "A4[01]")
+  ) %>%
+  group_by(hadm_id) %>%
+  summarise(across(dm:sepsis, any), .groups = "drop")
+
+# Ensure all hadm_ids are present (fill absent with FALSE)
+comorbidities <- cohort %>%
+  select(stay_id, hadm_id) %>%
+  left_join(comorbidities, by = "hadm_id") %>%
+  mutate(across(dm:sepsis, ~replace_na(., FALSE))) %>%
+  select(-hadm_id)
+
+rm(diagnoses); gc()
+
+# Prevalence check
+comorbidities %>%
+  summarise(across(dm:sepsis, ~round(mean(.) * 100, 1))) %>%
+  pivot_longer(everything(), names_to = "comorbidity", values_to = "pct") %>%
+  mutate(comorbidity = recode(comorbidity,
+    "dm" = "Diabetes Mellitus",
+    "htn" = "Hypertension",
+    "ckd" = "Chronic Kidney Disease (CKD)",
+    "copd" = "Chronic Obstructive Pulmonary Disease (COPD)",
+    "hf" = "Heart Failure",
+    "cad" = "Coronary Artery Disease (CAD)",
+    "sepsis" = "Sepsis"
+  )) %>%
+  arrange(desc(pct)) %>%
+  kable(col.names = c("Comorbidity", "% Prevalence"),
+        caption = "Comorbidity prevalence in cohort")
+```
+
+```{r race}
+admissions_raw <- read_csv(
+  paste0(mimic_path, "hosp/admissions.csv.gz"),
+  col_types = cols(hadm_id = col_integer(), race = col_character()),
+  show_col_types = FALSE
+) %>%
+  select(hadm_id, race)
+
+race_features <- cohort %>%
+  select(stay_id, hadm_id) %>%
+  left_join(admissions_raw, by = "hadm_id") %>%
+  mutate(
+    race_harmonized = case_when(
+      str_detect(toupper(race), "WHITE") ~ "White",
+      str_detect(toupper(race), "BLACK") ~ "Black",
+      str_detect(toupper(race), "HISPANIC") ~ "Hispanic",
+      str_detect(toupper(race), "ASIAN") ~ "Asian",
+      is.na(race) | str_detect(toupper(race),
+                               "UNKNOWN|UNABLE|OTHER") ~ "Other/Unknown",
+      TRUE ~ "Other/Unknown"
+    )
+  ) %>%
+  select(stay_id, race = race_harmonized)
+
+rm(admissions_raw); gc()
+
+race_features %>%
+  count(race) %>%
+  mutate(pct = round(n / sum(n) * 100, 1)) %>%
+  arrange(desc(n)) %>%
+  kable(col.names = c("Race/Ethnicity", "N", "%"),
+        caption = "Race/ethnicity distribution")
+```
+
+---
+
+## Step 4: Fluid Balance (DuckDB)
+
+Cumulative fluid inputs and outputs in the first 24 hours post-intubation.
+
+```{r fluid-inputs}
+inputs_raw <- dbGetQuery(con, glue("
+  SELECT
+    CAST(stay_id AS INTEGER) AS stay_id,
+    starttime,
+    CAST(amount AS DOUBLE)  AS amount,
+    amountuom
+  FROM read_csv_auto('{mimic_path}icu/inputevents.csv.gz',
+                     ignore_errors = true)
+  WHERE stay_id IN ({stay_ids_sql})
+    AND amount > 0
+    AND LOWER(amountuom) IN ('ml', 'ml.')
+"))
+```
+
+```{r fluid-outputs}
+outputs_raw <- dbGetQuery(con, glue("
+  SELECT
+    CAST(stay_id AS INTEGER) AS stay_id,
+    charttime,
+    CAST(value AS DOUBLE)  AS value
+  FROM read_csv_auto('{mimic_path}icu/outputevents.csv.gz',
+                     ignore_errors = true)
+  WHERE stay_id IN ({stay_ids_sql})
+    AND value > 0
+"))
+```
+
+```{r fluid-features}
+fluid_in <- inputs_raw %>%
+  inner_join(cohort %>% select(stay_id, vent_start), by = "stay_id") %>%
+  mutate(
+    starttime = parse_date_time(starttime,
+                                orders = c("ymd HMS", "ymd HM"),
+                                quiet  = TRUE),
+    hours_from_vent = as.numeric(difftime(starttime,
+                                          vent_start,
+                                          units = "hours"))
+  ) %>%
+  filter(hours_from_vent >= 0, hours_from_vent < 24) %>%
+  group_by(stay_id) %>%
+  summarise(total_fluid_in_24h = sum(amount, na.rm = TRUE), .groups = "drop")
+
+fluid_out <- outputs_raw %>%
+  inner_join(cohort %>% select(stay_id, vent_start), by = "stay_id") %>%
+  mutate(
+    charttime = parse_date_time(charttime,
+                                orders = c("ymd HMS", "ymd HM"),
+                                quiet  = TRUE),
+    hours_from_vent = as.numeric(difftime(charttime, vent_start,
+                                          units = "hours"))
+  ) %>%
+  filter(hours_from_vent >= 0, hours_from_vent < 24) %>%
+  group_by(stay_id) %>%
+  summarise(total_fluid_out_24h = sum(value, na.rm = TRUE), .groups = "drop")
+
+fluid_features <- cohort %>%
+  select(stay_id) %>%
+  left_join(fluid_in, by = "stay_id") %>%
+  left_join(fluid_out, by = "stay_id") %>%
+  mutate(
+    total_fluid_in_24h = replace_na(total_fluid_in_24h,  0),
+    total_fluid_out_24h = replace_na(total_fluid_out_24h, 0),
+    fluid_balance_24h = total_fluid_in_24h - total_fluid_out_24h
+  )
+
+rm(inputs_raw, outputs_raw, fluid_in, fluid_out)
+gc()
+```
+
+```{r fluid-summary-table}
+fluid_features %>%
+  left_join(cohort %>% select(stay_id, aki_stage), by = "stay_id") %>%
+  group_by(aki_stage) %>%
+  summarise(across(
+    c(total_fluid_in_24h, total_fluid_out_24h, fluid_balance_24h),
+    list(
+      median = ~round(median(., na.rm = TRUE)),
+      q25 = ~round(quantile(., 0.25, na.rm = TRUE)),
+      q75 = ~round(quantile(., 0.75, na.rm = TRUE))
+    )
+  )) %>%
+  mutate(
+    `Fluid In [IQR]` = sprintf("%s [%s–%s]",
+      format(total_fluid_in_24h_median, big.mark=","),
+      format(total_fluid_in_24h_q25, big.mark=","),
+      format(total_fluid_in_24h_q75, big.mark=",")),
+    `Fluid Out [IQR]` = sprintf("%s [%s–%s]",
+      format(total_fluid_out_24h_median, big.mark=","),
+      format(total_fluid_out_24h_q25, big.mark=","),
+      format(total_fluid_out_24h_q75, big.mark=",")),
+    `Net Balance [IQR]` = sprintf("%s [%s–%s]",
+      format(fluid_balance_24h_median, big.mark=","),
+      format(fluid_balance_24h_q25, big.mark=","),
+      format(fluid_balance_24h_q75, big.mark=","))
+  ) %>%
+  select(aki_stage, `Fluid In [IQR]`, `Fluid Out [IQR]`,
+         `Net Balance [IQR]`) %>%
+  kable(col.names = c("AKI Stage", "Total Input mL [IQR]",
+                      "Total Output mL [IQR]", "Net Balance mL [IQR]"),
+        caption = "24-hour fluid balance by AKI stage at intubation")
+```
+
+```{r fluid-plot}
+fluid_features %>%
+  left_join(cohort %>% select(stay_id, aki_stage), by = "stay_id") %>%
+  filter(!is.na(aki_stage), fluid_balance_24h > -5000,
+         fluid_balance_24h < 15000) %>%
+  ggplot(aes(x = aki_stage, y = fluid_balance_24h, fill = aki_stage)) +
+  geom_boxplot(outlier.size = 0.5, outlier.alpha = 0.4) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  scale_fill_manual(values = c("No AKI" = "#2ecc71", "Stage 1" = "#f39c12")) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(title = "24-Hour Fluid Balance by AKI Stage at Intubation",
+       x = NULL, y = "Net Fluid Balance (mL)", fill = "AKI Stage") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+---
+
+## Step 5: Vasopressor Exposure (DuckDB)
+
+Binary flag and total hours of vasopressor infusion in the first 24 hours.
+
+```{r vasopressor-query}
+vaso_sql <- paste(c(221906,   # norepinephrine
+                    221289,   # epinephrine
+                    222315,   # vasopressin
+                    221662,   # dopamine
+                    221653,   # dobutamine
+                    221749),  # phenylephrine
+                  collapse = ",")
+
+vaso_raw <- dbGetQuery(con, glue("
+  SELECT
+    CAST(stay_id AS INTEGER) AS stay_id,
+    CAST(itemid AS INTEGER) AS itemid,
+    starttime,
+    endtime,
+    CAST(rate AS DOUBLE)  AS rate,
+    rateuom
+  FROM read_csv_auto('{mimic_path}icu/inputevents.csv.gz',
+                     ignore_errors = true)
+  WHERE itemid  IN ({vaso_sql})
+    AND stay_id IN ({stay_ids_sql})
+"))
+
+dbDisconnect(con, shutdown = TRUE)
+```
+
+```{r vasopressor-features}
+vaso_features <- vaso_raw %>%
+  inner_join(cohort %>% select(stay_id, vent_start), by = "stay_id") %>%
+  mutate(
+    starttime = parse_date_time(starttime,orders = c("ymd HMS", "ymd HM"),
+                                quiet = TRUE),
+    endtime = parse_date_time(endtime,orders = c("ymd HMS", "ymd HM"),
+                              quiet = TRUE),
+    hours_start = as.numeric(difftime(starttime,vent_start, units = "hours")),
+    hours_end = as.numeric(difftime(endtime,vent_start, units = "hours")),
+    hours_start_clipped = pmax(hours_start, 0),
+    hours_end_clipped = pmin(hours_end, 24)
+  ) %>%
+  filter(hours_start < 24, hours_end > 0) %>%
+  group_by(stay_id) %>%
+  summarise(
+    vasopressor_24h = 1L,
+    vasopressor_hours_24h = sum(pmax(hours_end_clipped - hours_start_clipped,
+                                     0),na.rm = TRUE
+    ),
+    .groups = "drop"
+  )
+
+vaso_features <- cohort %>%
+  select(stay_id) %>%
+  left_join(vaso_features, by = "stay_id") %>%
+  mutate(
+          vasopressor_24h = replace_na(vasopressor_24h, 0L),
+          vasopressor_hours_24h = replace_na(vasopressor_hours_24h, 0)
+  )
+
+# Vasopressor dose rates (mcg/kg/min) for SOFA cardiovascular scoring
+vaso_doses <- vaso_raw %>%
+  filter(itemid %in% c(221906L, 221289L, 221662L, 221653L)) %>%
+  inner_join(cohort %>% select(stay_id, vent_start), by = "stay_id") %>%
+  mutate(
+    starttime = parse_date_time(starttime, orders = c("ymd HMS", "ymd HM"),
+                                quiet = TRUE),
+    hours_start = as.numeric(difftime(starttime, vent_start, units = "hours"))
+  ) %>%
+  filter(hours_start >= 0, hours_start < 24, !is.na(rate), rate > 0) %>%
+  left_join(select(hw_features, stay_id, weight_kg), by = "stay_id") %>%
+  mutate(
+          dose_mcg_kg_min = case_when(
+                  str_detect(tolower(rateuom), "mcg/kg/min") ~ rate,
+                  str_detect(tolower(rateuom), "mcg/min")    ~ rate / weight_kg,
+                  TRUE ~ NA_real_
+                  )
+          ) %>%
+  group_by(stay_id, itemid) %>%
+  summarise(max_dose = max(dose_mcg_kg_min, na.rm = TRUE), .groups = "drop") %>%
+  mutate(
+    max_dose = if_else(is.infinite(max_dose), NA_real_, max_dose),
+    itemid = paste0("vaso_dose_", itemid)
+  ) %>%
+  pivot_wider(names_from = itemid, values_from = max_dose, values_fill = 0)
+
+vaso_doses <- cohort %>%
+  select(stay_id) %>%
+  left_join(vaso_doses, by = "stay_id") %>%
+  mutate(across(starts_with("vaso_dose_"), ~replace_na(., 0)))
+
+rm(vaso_raw)
+gc()
+```
+
+```{r vaso-summary-table}
+vaso_features %>%
+  left_join(cohort %>% select(stay_id, aki_stage), by = "stay_id") %>%
+  group_by(aki_stage) %>%
+  summarise(
+    n = n(),
+    n_vaso = sum(vasopressor_24h),
+    pct_vaso = round(mean(vasopressor_24h) * 100, 1),
+    median_hours = round(median(vasopressor_hours_24h[vasopressor_24h == 1],
+                                    na.rm = TRUE), 1),
+    q25_hours = round(quantile(vasopressor_hours_24h[vasopressor_24h == 1],
+                                      0.25, na.rm = TRUE), 1),
+    q75_hours = round(quantile(vasopressor_hours_24h[vasopressor_24h == 1],
+                                      0.75, na.rm = TRUE), 1)
+  ) %>%
+  mutate(`Hours on vasopressors [IQR]` =
+           sprintf("%.1f [%.1f–%.1f]", median_hours, q25_hours, q75_hours)) %>%
+  select(aki_stage, n, n_vaso, pct_vaso, `Hours on vasopressors [IQR]`) %>%
+  kable(col.names = c("AKI Stage", "N", "On Vasopressors", "% on Vasopressors",
+                      "Hours [IQR] (among users)"),
+        caption = "Vasopressor use in first 24h by AKI stage at intubation")
+```
+
+```{r vaso-plot}
+vaso_features %>%
+  left_join(cohort %>% select(stay_id, aki_stage), by = "stay_id") %>%
+  filter(!is.na(aki_stage)) %>%
+  group_by(aki_stage) %>%
+  summarise(pct_vaso = mean(vasopressor_24h) * 100, .groups = "drop") %>%
+  ggplot(aes(x = aki_stage, y = pct_vaso, fill = aki_stage)) +
+  geom_col(width = 0.5, show.legend = FALSE) +
+  geom_text(aes(label = sprintf("%.1f%%", pct_vaso)), vjust = -0.5, size = 4) +
+  scale_fill_manual(values = c("No AKI" = "#2ecc71", "Stage 1" = "#f39c12")) +
+  scale_y_continuous(limits = c(0, 100), labels = function(x) paste0(x, "%")) +
+  labs(title = "Vasopressor Use in First 24h by AKI Stage",
+       x = NULL, y = "% on Vasopressors") +
+  theme_minimal()
+```
+
+---
+
+## Step 6: Assemble Feature Matrix (Observed Labs + All Other Features)
+
+Join all feature blocks into `feature_matrix_base`. Lab columns have NAs where
+labs were not drawn — these will be reviewed for missingness/correlation before imputation.
+
+```{r assemble}
+# Meta/outcome columns — kept for row identification
+meta_cols <- c(
+  "stay_id", "subject_id", "hadm_id", "anchor_year",
+  "age", "gender", "admission_type",
+  "baseline_creat", "baseline_source", "aki_stage", "creat_fold_increase",
+  "icu_los_days", "hosp_los_days", "vent_duration_hours",
+  "hospital_expire_flag",
+  "vent_start", "vent_end", "intime", "admittime", "outtime", "deathtime",
+  "aki_stage2_7d", "time_to_aki_hours", "n_creat_obs_7d"
+)
+
+feature_matrix_base <- cohort %>%
+  select(
+    stay_id, subject_id, hadm_id, anchor_year,
+    age, gender, admission_type,
+    baseline_creat, baseline_source, aki_stage, creat_fold_increase,
+    icu_los_days, hosp_los_days, vent_duration_hours,
+    hospital_expire_flag,
+    vent_start, vent_end, intime, admittime,
+    outtime, deathtime
+  ) %>%
+  left_join(outcome %>% select(-max_creat_7d), by = "stay_id") %>%
+  left_join(features_wide, by = "stay_id") %>%  # combined labs + chart (NAs where not drawn)
+  left_join(fluid_features, by = "stay_id") %>%
+  left_join(vaso_features, by = "stay_id") %>%
+  left_join(vaso_doses, by = "stay_id") %>%
+  left_join(hw_features, by = "stay_id") %>%
+  left_join(comorbidities, by = "stay_id") %>%
+  left_join(race_features, by = "stay_id")
+
+stopifnot(nrow(feature_matrix_base) == nrow(cohort))
+stopifnot(!any(duplicated(feature_matrix_base$stay_id)))
+```
+
+```{r assemble-summary-table}
+tibble(
+  Metric = c("Total stays", "Total columns", "Outcome: AKI Stage 2+ (events)",
+              "Outcome: No progression", "Outcome: Unknown (no creatinine)",
+              "Outcome prevalence (evaluable only)"),
+  Value = c(
+    format(nrow(feature_matrix_base), big.mark = ","),
+    ncol(feature_matrix_base),
+    sum(feature_matrix_base$aki_stage2_7d == 1L, na.rm = TRUE),
+    sum(feature_matrix_base$aki_stage2_7d == 0L, na.rm = TRUE),
+    sum(is.na(feature_matrix_base$aki_stage2_7d)),
+    sprintf("%.1f%%", mean(feature_matrix_base$aki_stage2_7d, na.rm = TRUE) * 100)
+  )
+) %>%
+  kable(caption = "Feature matrix base — combined labs + chart events (NAs where not drawn)")
+```
+
+---
+
+## Step 6b: Derive BMI, P/F Ratio, and SOFA Components
+
+Compute derived features from observed (non-imputed) values. These must be
+derived **before** any feature drops because they depend on columns that may
+be removed (e.g. `pao2_min`, `platelet_min`, `bilirubin_max`).
+
+```{r derive-features}
+# Computes BMI, P/F ratio, and SOFA components from the full feature_matrix_base.
+# These derived cols must be computed BEFORE column selection because they depend
+# on columns (e.g. pao2_min, platelet_min, creatinine_max) not in the target list.
+derive_features <- function(fm) {
+  # BMI
+  fm <- fm %>%
+    mutate(
+      bmi = if_else(
+        !is.na(weight_kg) & !is.na(height_cm),
+        weight_kg / (height_cm / 100)^2,
+        NA_real_
+      ),
+      bmi = if_else(bmi < 10 | bmi > 80, NA_real_, bmi)
+    )
+
+  # P/F Ratio (uses pao2_min + fio2_mean — kept in base but not in target list)
+  fm <- fm %>%
+    mutate(
+      pf_ratio = pao2_min / (fio2_mean / 100),
+      pf_ratio = if_else(pf_ratio < 20 | pf_ratio > 600, NA_real_, pf_ratio)
+    )
+
+  # SOFA Score components
+  fm <- fm %>%
+    mutate(
+      sofa_resp = case_when(
+        pf_ratio < 100 ~ 4L, pf_ratio < 200 ~ 3L,
+        pf_ratio < 300 ~ 2L, pf_ratio < 400 ~ 1L,
+        !is.na(pf_ratio) ~ 0L, TRUE ~ NA_integer_
+      ),
+      sofa_coag = case_when(
+        platelet_min < 20 ~ 4L, platelet_min < 50 ~ 3L,
+        platelet_min < 100 ~ 2L, platelet_min < 150 ~ 1L,
+        !is.na(platelet_min) ~ 0L, TRUE ~ 0L
+      ),
+      sofa_liver = case_when(
+        bilirubin_max >= 12.0 ~ 4L, bilirubin_max >= 6.0 ~ 3L,
+        bilirubin_max >= 2.0  ~ 2L, bilirubin_max >= 1.2 ~ 1L,
+        TRUE ~ 0L
+      ),
+      sofa_cardio = case_when(
+        coalesce(vaso_dose_221662, 0) > 15 |
+          coalesce(vaso_dose_221289, 0) > 0.1 |
+          coalesce(vaso_dose_221906, 0) > 0.1 ~ 4L,
+        coalesce(vaso_dose_221662, 0) > 5 |
+          (coalesce(vaso_dose_221289, 0) > 0 & 
+                   coalesce(vaso_dose_221289, 0) <= 0.1) |
+          (coalesce(vaso_dose_221906, 0) > 0 & 
+                   coalesce(vaso_dose_221906, 0) <= 0.1) ~ 3L,
+        coalesce(vaso_dose_221662, 0) > 0 |
+          coalesce(vaso_dose_221653, 0) > 0 ~ 2L,
+        !is.na(map_mean) & map_mean < 70 ~ 1L,
+        TRUE ~ 0L
+      ),
+      sofa_neuro = case_when(
+        gcs_total_mean < 6 ~ 4L, gcs_total_mean < 10 ~ 3L,
+        gcs_total_mean < 13 ~ 2L, gcs_total_mean < 15 ~ 1L,
+        !is.na(gcs_total_mean) ~ 0L, TRUE ~ 0L
+      )
+    )
+
+  fm
+}
+
+feature_matrix_derived <- derive_features(feature_matrix_base)
+cat(sprintf("feature_matrix_derived: %d rows x %d cols\n",
+            nrow(feature_matrix_derived), ncol(feature_matrix_derived)))
+```
+
+---
+
+## Step 6c: Correlation on `_mean` Columns (|r| ≥ 0.9)
+
+Run correlation on all `_mean` numeric columns to identify highly redundant features.
+**Only mean values are used** — this captures the primary signal while keeping the
+analysis tractable. A threshold of |r| ≥ 0.9 flags near-duplicate features.
+
+```{r corr-matrix, fig.width=14, fig.height=14}
+# All _mean columns (exclude outcome and leakage cols)
+mean_cols <- names(feature_matrix_derived)[endsWith(names(feature_matrix_derived), 
+                                                    "_mean")]
+mean_cols <- setdiff(mean_cols, c("time_to_aki_hours"))
+
+cor_mat <- cor(feature_matrix_derived[, mean_cols], 
+               use = "pairwise.complete.obs")
+
+# All pairs with |r| >= 0.9 (upper triangle only)
+high_cor_idx <- which(abs(cor_mat) >= 0.9 & upper.tri(cor_mat), arr.ind = TRUE)
+
+if (nrow(high_cor_idx) == 0) {
+  cat("No column pairs with |r| >= 0.9 found.\n")
+} else {
+  pct_miss_mean <- colMeans(is.na(feature_matrix_derived[, mean_cols])) * 100
+
+  high_cor_df <- data.frame(
+    var1 = rownames(cor_mat)[high_cor_idx[, 1]],
+    var2 = colnames(cor_mat)[high_cor_idx[, 2]],
+    r  = round(cor_mat[high_cor_idx], 3)
+  ) |>
+    mutate(
+      miss_var1 = round(pct_miss_mean[var1], 1),
+      miss_var2 = round(pct_miss_mean[var2], 1)
+    ) |>
+    arrange(desc(abs(r)))
+
+  cat(sprintf("Found %d pairs with |r| >= 0.9.\n\n", nrow(high_cor_df)))
+  cat("Review: for each pair, add the base feature name you want to DROP\n")
+  cat("to 'features_to_drop' in Step 6d below.\n\n")
+  print(high_cor_df, row.names = FALSE)
+  write.csv(high_cor_df, "feature_high_correlations.csv", row.names = FALSE)
+}
+
+# Replace NAs with 0 before hclust (NAs from sparse cols with no pairwise obs)
+cor_mat_plot <- cor_mat
+cor_mat_plot[is.na(cor_mat_plot)] <- 0
+
+ggcorrplot(cor_mat_plot,
+           method = "square",
+           type = "lower",
+           hc.order = TRUE,
+           lab  = FALSE,
+           colors = c("#2196F3", "white", "#F44336"),
+           title = sprintf("Correlation heatmap — %d _mean predictors", 
+                              length(mean_cols)),
+           ggtheme  = theme_minimal(base_size = 7))
+```
+
+---
+
+## Step 6d: Manual Feature Drop
+
+Review `feature_high_correlations.csv` and `high_cor_df` above.
+Add the **base feature name** (without `_mean`/`_min`/etc.) to `features_to_drop`
+for each feature you want to remove. This drops **all statistics** for that feature
+(`_mean`, `_min`, `_max`, `_sd`, `_n`).
+
+```{r feature-drop}
+features_to_drop <- c(
+  "peep_total",   
+  "peep_set", 
+  "map_invasive", 
+  "prothrombin",  
+  "hematocrit" 
+)
+
+if (length(features_to_drop) > 0) {
+  drop_pattern <- paste0("^(", paste(features_to_drop, collapse = "|"), 
+                         ")_(mean|min|max|sd|n)$")
+  cols_to_drop <- grep(drop_pattern, names(feature_matrix_derived), 
+                       value = TRUE)
+  cat(sprintf("Dropping %d columns for %d base features:\n",
+              length(cols_to_drop), length(features_to_drop)))
+  cat(paste0("  ", cols_to_drop, collapse = "\n"), "\n")
+  feature_matrix_final <- feature_matrix_derived |> 
+          select(-all_of(cols_to_drop))
+} else {
+  cat("No features dropped (features_to_drop is empty). Run Step 6c first.\n")
+  feature_matrix_final <- feature_matrix_derived
+}
+
+cat(sprintf("\nfeature_matrix_final: %s rows x %d cols\n",
+            format(nrow(feature_matrix_final), big.mark = ","),
+            ncol(feature_matrix_final)))
+```
+
+---
+
+## Step 6e: Save Pre-Imputation Matrix
+
+```{r save-preimputation}
+saveRDS(feature_matrix_final, "feature_matrix_preimputation.rds")
+
+missingness_selected <- data.frame(
+  variable    = names(feature_matrix_final),
+  pct_missing = round(colMeans(is.na(feature_matrix_final)) * 100, 1)
+) %>% arrange(desc(pct_missing))
+write.csv(missingness_selected, "feature_missingness_selected.csv", row.names = FALSE)
+```

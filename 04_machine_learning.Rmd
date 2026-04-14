@@ -1,0 +1,983 @@
+---
+title: "AKI Prediction — Machine Learning Pipeline"
+subtitle: "BIOSTAT 203B Final Project"
+author: "Rica Pitogo"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: hide
+    fig_width: 10
+    fig_height: 6
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  cache   = FALSE,
+  fig.width  = 10,
+  fig.height = 6
+)
+```
+
+## Overview
+
+This notebook trains five machine learning classifiers to predict **AKI Stage 2+ within 7 days of mechanical ventilation** in ICU patients. The input is the MICE-imputed stacked feature matrix (`feature_matrix_imputed_stacked.rds`, m = 5 imputations).
+
+**Multi-imputation (MI) strategy:**
+
+1. Split unique `stay_id`s (80/20, stratified by outcome) — done once before touching stacked data to prevent patient-level leakage.
+2. Tune hyperparameters on imputation 1 (`.imp == 1`) via 5-fold CV.
+3. Fit each model on all 5 imputed training sets (20 total fits).
+4. For each test patient, average predicted probabilities across 5 imputed test rows (Rubin's rule adapted for predictions).
+5. Evaluate pooled predictions.
+
+---
+
+## 1. Libraries and Setup
+
+```{r libraries}
+library(tidyverse)
+library(tidymodels)
+library(ranger)      
+library(xgboost)     
+library(glmnet)      
+library(kernlab)    
+library(probably)    
+library(pROC)        
+library(patchwork)   
+library(doParallel)  
+library(knitr)
+library(scales)
+
+tidymodels_prefer()
+
+# Set random seed
+set.seed(203)
+```
+
+---
+
+## 2. Load Data and Define Predictors
+
+```{r load-data}
+stacked <- readRDS("feature_matrix_imputed_stacked.rds")
+
+cat("Dimensions:", nrow(stacked), "rows x", ncol(stacked), "cols\n")
+cat("Imputations:", sort(unique(stacked$.imp)), "\n")
+cat("Unique stay_ids:", n_distinct(stacked$stay_id), "\n")
+```
+
+```{r define-predictors}
+# All 74 candidate predictors
+
+predictor_cols <- c(
+  # Demographics
+  "age", "gender", "admission_type",
+ 
+  # Labs (24h mean)
+  "bicarbonate_mean", "chloride_mean", "glucose_mean", 
+  "hemoglobin_mean", "inr_mean", "magnesium_mean", "paco2_mean",
+  "pao2_mean", "ph_mean", "platelet_mean", "potassium_mean",
+  "ptt_mean", "sodium_mean", "wbc_mean", "bilirubin_mean", "calcium_mean",
+  "lactate_mean", "phosphate_mean",
+  
+  # Ventilator / vitals (24h mean)
+  "fio2_mean", "gcs_eye_mean", "gcs_motor_mean",
+  "heart_rate_mean", "map_noninvasive_mean",
+  "plateau_pressure_mean", "resp_rate_obs_mean", "resp_rate_set_mean",
+  "sbp_invasive_mean", "sbp_noninvasive_mean",
+  "spo2_mean", "temp_f_mean", "tidal_vol_obs_mean", "tidal_vol_set_mean",
+  
+  # Derived ventilator
+  "peep_mean", "driving_pressure_mean", "map_mean", "gcs_total_mean",
+  
+  # Fluids
+  "total_fluid_in_24h", "total_fluid_out_24h", "fluid_balance_24h",
+  
+  # Vasopressors
+  "vasopressor_24h", "vasopressor_hours_24h", "vaso_dose_221906", 
+  "vaso_dose_221289", "vaso_dose_221653", "vaso_dose_221662",
+  
+  # Height and Weight
+  "height_cm", "weight_kg",
+  
+  # Comorbidities
+  "dm", "htn", "ckd", "copd", "hf", "cad", "sepsis",
+  
+  # Demographics
+  "race",
+  
+  # Derived
+  "bmi", "pf_ratio",
+  
+  # SOFA components (sofa_renal excluded)
+  "sofa_resp", "sofa_coag", "sofa_liver", "sofa_cardio", "sofa_neuro"
+)
+
+predictor_cols <- intersect(predictor_cols, names(stacked))
+```
+
+---
+
+## 3. Prepare Data
+
+```{r prepare-data}
+race_levels <- c("White", "Black", "Hispanic", "Asian", "Other/Unknown")
+
+stacked_clean <- stacked |>
+  filter(!is.na(aki_stage2_7d)) |>
+  mutate(
+    # Outcome: AKI as first level (positive event for tidymodels metrics)
+    aki_stage2_7d = factor(aki_stage2_7d, levels = c(1, 0), 
+                           labels = c("AKI", "No_AKI")),
+    
+    # Categorical predictors
+    gender = factor(gender, levels = c("M", "F")),
+    admission_type = factor(admission_type),
+    race = factor(race, levels = race_levels),
+    
+    # Binary flags as integer
+    across(c(dm, htn, ckd, copd, hf, cad, sepsis, vasopressor_24h), as.integer)
+  ) |>
+  select(stay_id, .imp, aki_stage2_7d, all_of(predictor_cols))
+
+cat("Rows after dropping unknown outcomes:", nrow(stacked_clean), "\n")
+cat("Unique stay_ids:", n_distinct(stacked_clean$stay_id), "\n")
+```
+
+### Outcome Distribution
+
+```{r outcome-distribution}
+stacked_clean |>
+  filter(.imp == 1) |>
+  count(aki_stage2_7d) |>
+  mutate(pct = round(n / sum(n) * 100, 1)) |>
+  kable(col.names = c("Outcome", "N", "%"),
+        caption = "Outcome distribution (imputation 1, representative)")
+```
+
+### Residual Missingness Check
+
+```{r missingness-check}
+residual_na <- stacked_clean |>
+  filter(.imp == 1) |>
+  select(all_of(predictor_cols)) |>
+  summarise(across(everything(), \(x) sum(is.na(x)))) |>
+  pivot_longer(everything(), names_to = "variable", values_to = "n_missing") |>
+  filter(n_missing > 0) |>
+  arrange(desc(n_missing))
+
+if (nrow(residual_na) == 0) {
+  cat("No residual NAs in predictor columns. MICE imputation complete.\n")
+} else {
+  cat("WARNING — residual NAs found post-MICE:\n")
+  print(residual_na)
+}
+```
+
+---
+
+## 4. Train/Test Split (80/20, Stratified on Unique Stay IDs)
+The stacked data has 5 identical copies of each patient's outcome row (one per imputation). Splitting rows directly would allow the same patient's copies to appear in both train and test — data leakage. Splitting unique IDs first, then filtering the stacked data, ensures complete patient-level separation.
+
+```{r train-test-split}
+set.seed(203)
+
+# Step 1: Get unique stay_ids with their outcomes
+stay_outcomes <- stacked_clean |>
+  filter(.imp == 1) |>
+  select(stay_id, aki_stage2_7d)
+
+# Step 2: 80/20 stratified split on unique stay_ids
+split_ids <- initial_split(stay_outcomes, prop = 0.80, strata = aki_stage2_7d)
+train_ids <- training(split_ids) |> pull(stay_id)
+test_ids <- testing(split_ids)  |> pull(stay_id)
+
+cat("Train stay_ids:", length(train_ids), "\n")
+cat("Test stay_ids:", length(test_ids), "\n")
+
+# Step 3: Filter stacked data
+train_stack <- stacked_clean |> filter(stay_id %in% train_ids)
+test_stack <- stacked_clean |> filter(stay_id %in% test_ids)
+
+# Sanity checks
+stopifnot(nrow(train_stack) == length(train_ids) * 5)
+stopifnot(nrow(test_stack)  == length(test_ids)  * 5)
+stopifnot(length(intersect(train_ids, test_ids)) == 0)
+
+cat("Train rows:", nrow(train_stack), "(", length(train_ids), 
+    "patients x 5 imputations)\n")
+cat("Test rows:", nrow(test_stack), "(", length(test_ids), 
+    "patients x 5 imputations)\n")
+```
+
+### Stratification Check
+
+```{r stratification-check}
+list(Train = train_ids, Test = test_ids) |>
+  map_dfr(\(ids) {
+    stay_outcomes |>
+      filter(stay_id %in% ids) |>
+      count(aki_stage2_7d) |>
+      mutate(pct = round(n / sum(n) * 100, 1))
+  }, .id = "Split") |>
+  kable(col.names = c("Split", "Outcome", "N", "%"),
+        caption = "Outcome distribution: train vs. test (unique stay_ids)")
+```
+
+---
+
+## 5. Preprocessing Recipes
+
+Two recipes: one for penalized regression and SVM (requires normalization), one for tree-based models.
+
+The reference training frame uses `.imp == 1` to define column types and factor levels. The same recipe blueprint is applied to each imputed dataset at fit time.
+
+```{r recipes}
+# Using first imputation as reference for recipe prep (column types, factor levels)
+train_imp1 <- train_stack |>
+  filter(.imp == 1) |>
+  select(-stay_id, -.imp)
+
+# Recipe for Logistic Regression (LASSO) and SVM — normalize
+recipe_glm <- recipe(aki_stage2_7d ~ ., data = train_imp1) |>
+  step_dummy(gender, admission_type, race, one_hot = FALSE) |>
+  step_zv(all_predictors()) |>
+  step_normalize(all_numeric_predictors())
+
+# Recipe for Random Forest and XGBoost — no normalization needed
+recipe_tree <- recipe(aki_stage2_7d ~ ., data = train_imp1) |>
+  step_dummy(gender, admission_type, race, one_hot = FALSE) |>
+  step_zv(all_predictors())
+
+# Verify recipes work on training data
+cat("GLM recipe columns after prep:",
+    ncol(prep(recipe_glm) |> bake(new_data = NULL)), "\n")
+cat("Tree recipe columns after prep:",
+    ncol(prep(recipe_tree) |> bake(new_data = NULL)), "\n")
+
+# Check no NAs remain after recipe
+baked_check <- prep(recipe_glm) |> bake(new_data = NULL)
+if (any(is.na(baked_check))) {
+  warning("NAs found after recipe baking — check predictor preparation")
+} else {
+  cat("No NAs in baked training data. \n")
+}
+```
+
+---
+
+## 6. Model Specifications
+
+```{r model-specs}
+n_cores <- max(1, parallel::detectCores() - 2)
+
+# Model 0: Logistic Regression (unpenalized) — baseline
+spec_logit <- logistic_reg() |>
+  set_engine("glm") |>
+  set_mode("classification")
+
+# Model 1: Logistic Regression with LASSO (L1 penalty)
+# mixture = 1 → pure LASSO; automatically selects features
+spec_lr <- logistic_reg(
+        penalty = tune(), 
+        mixture = 1) |>
+  set_engine("glmnet") |>
+  set_mode("classification")
+
+# Model 2: Random Forest 
+spec_rf <- rand_forest(
+        mtry = tune(), 
+        min_n = tune(), 
+        trees = 500) |>
+  set_engine("ranger",
+             importance = "impurity",
+             num.threads = n_cores) |>
+  set_mode("classification")
+
+# Model 3: XGBoost
+spec_xgb <- boost_tree(
+  trees = tune(),
+  tree_depth = tune(),
+  learn_rate = tune(),
+  min_n = tune(),
+  loss_reduction = tune(),
+  sample_size = tune()
+) |>
+  set_engine("xgboost") |>
+  set_mode("classification")
+
+# Model 4: Support Vector Machine (RBF kernel)
+spec_svm <- svm_rbf(
+        cost = tune(), 
+        rbf_sigma = tune()) |>
+  set_engine("kernlab") |>
+  set_mode("classification")
+
+# Logistic baseline workflow 
+wf_logit <- workflow() |>
+  add_recipe(recipe_glm) |>
+  add_model(spec_logit)
+```
+
+---
+
+## 7. Hyperparameter Tuning (on Imputation 1)
+
+Tuning is performed on `.imp == 1` only. This is a deliberate performance-correctness trade-off: the variance in optimal hyperparameters across MICE imputations is typically small, and the computational cost of 5× tuning is not justified. The best hyperparameters from `.imp == 1` are then applied uniformly when fitting all 5 models.
+
+```{r cv-setup}
+# 5-fold CV stratified on outcome (within training set of imputation 1)
+cv_folds <- vfold_cv(train_imp1, v = 5, strata = aki_stage2_7d)
+tune_metric <- metric_set(roc_auc)
+```
+
+### 7.1 Logistic Regression (LASSO)
+
+```{r tune-lr}
+wf_lr <- workflow() |>
+  add_recipe(recipe_glm) |>
+  add_model(spec_lr)
+
+lr_grid <- grid_regular(
+  penalty(range = c(-4, 0), trans = log10_trans()),
+  levels = 30
+)
+
+cl <- makePSOCKcluster(n_cores)
+registerDoParallel(cl)
+
+tune_lr <- tune_grid(
+  wf_lr,
+  resamples = cv_folds,
+  grid = lr_grid,
+  metrics = tune_metric,
+  control = control_grid(save_pred = FALSE, verbose = FALSE)
+)
+
+stopCluster(cl)
+
+best_lr <- select_best(tune_lr, metric = "roc_auc")
+cat("Best LASSO penalty:", best_lr$penalty, "\n")
+cat("Best CV AUROC (LASSO):", round(show_best(tune_lr, metric = "roc_auc", 
+                                              n = 1)$mean, 4), "\n")
+
+autoplot(tune_lr) +
+  labs(title = "LASSO: CV AUROC vs. Penalty") +
+  theme_minimal()
+```
+
+### 7.2 Random Forest
+
+```{r tune-rf}
+wf_rf <- workflow() |>
+  add_recipe(recipe_tree) |>
+  add_model(spec_rf)
+
+rf_grid <- grid_latin_hypercube(
+  mtry(range = c(5L, 25L)),
+  min_n(range = c(5L, 30L)),
+  size = 20
+)
+
+cl <- makePSOCKcluster(n_cores)
+registerDoParallel(cl)
+
+tune_rf <- tune_grid(
+  wf_rf,
+  resamples = cv_folds,
+  grid = rf_grid,
+  metrics = tune_metric,
+  control = control_grid(save_pred = FALSE, verbose = FALSE)
+)
+
+stopCluster(cl)
+
+best_rf <- select_best(tune_rf, metric = "roc_auc")
+cat("Best RF mtry:", best_rf$mtry, "| min_n:", best_rf$min_n, "\n")
+cat("Best CV AUROC (RF):", round(show_best(tune_rf, metric = "roc_auc", 
+                                           n = 1)$mean, 4), "\n")
+
+autoplot(tune_rf) +
+  labs(title = "Random Forest: CV AUROC vs. Hyperparameters") +
+  theme_minimal()
+```
+
+### 7.3 XGBoost
+
+```{r tune-xgb}
+wf_xgb <- workflow() |>
+  add_recipe(recipe_tree) |>
+  add_model(spec_xgb)
+
+xgb_grid <- grid_latin_hypercube(
+  trees(range = c(100L, 1000L)),
+  tree_depth(range = c(3L, 8L)),
+  learn_rate(range = c(-3, -1)),
+  min_n(range = c(5L, 30L)),
+  loss_reduction(),
+  sample_size = sample_prop(range = c(0.5, 1.0)),
+  size = 30
+)
+
+cl <- makePSOCKcluster(n_cores)
+registerDoParallel(cl)
+
+tune_xgb <- tune_grid(
+  wf_xgb,
+  resamples = cv_folds,
+  grid = xgb_grid,
+  metrics = tune_metric,
+  control = control_grid(save_pred = FALSE, verbose = FALSE)
+)
+
+stopCluster(cl)
+
+best_xgb <- select_best(tune_xgb, metric = "roc_auc")
+cat("Best XGB trees:", best_xgb$trees,
+    "| depth:", best_xgb$tree_depth,
+    "| lr:", round(best_xgb$learn_rate, 5), "\n")
+cat("Best CV AUROC (XGBoost):", round(show_best(tune_xgb, metric = "roc_auc", 
+                                                n = 1)$mean, 4), "\n")
+
+autoplot(tune_xgb) +
+  labs(title = "XGBoost: CV AUROC vs. Hyperparameters") +
+  theme_minimal()
+```
+
+### 7.4 SVM (RBF Kernel)
+
+```{r tune-svm}
+wf_svm <- workflow() |>
+  add_recipe(recipe_glm) |>
+  add_model(spec_svm)
+
+svm_grid <- grid_latin_hypercube(
+  cost(),
+  rbf_sigma(),
+  size = 20
+)
+
+cl <- makePSOCKcluster(n_cores)
+registerDoParallel(cl)
+
+tune_svm <- tune_grid(
+  wf_svm,
+  resamples = cv_folds,
+  grid = svm_grid,
+  metrics = tune_metric,
+  control = control_grid(save_pred = FALSE, verbose = FALSE)
+)
+
+stopCluster(cl)
+
+best_svm <- select_best(tune_svm, metric = "roc_auc")
+cat("Best SVM cost:", round(best_svm$cost, 4),
+    "| rbf_sigma:", round(best_svm$rbf_sigma, 6), "\n")
+cat("Best CV AUROC (SVM):", round(show_best(tune_svm, metric = "roc_auc", 
+                                            n = 1)$mean, 4), "\n")
+
+autoplot(tune_svm) +
+  labs(title = "SVM: CV AUROC vs. Hyperparameters") +
+  theme_minimal()
+```
+
+### CV Results Summary
+
+```{r cv-summary}
+# Logistic baseline: fit inline on train_imp1 
+logit_train_auroc <- fit(wf_logit, data = train_imp1) |>
+  augment(train_imp1) |>
+  roc_auc(truth = aki_stage2_7d, .pred_AKI, event_level = "first") |>
+  pull(.estimate)
+
+logit_cv_row <- tibble(
+  model = "Logistic Regression",
+  mean = logit_train_auroc,
+  std_err = NA_real_,
+  n = NA_integer_
+)
+
+cv_summary <- bind_rows(
+  logit_cv_row,
+  show_best(tune_lr,  metric = "roc_auc", n = 1) |> mutate(model = "LASSO"),
+  show_best(tune_rf,  metric = "roc_auc", n = 1) |> mutate(model = "Random Forest"),
+  show_best(tune_xgb, metric = "roc_auc", n = 1) |> mutate(model = "XGBoost"),
+  show_best(tune_svm, metric = "roc_auc", n = 1) |> mutate(model = "SVM")
+) |>
+  select(model, mean, std_err, n) |>
+  arrange(desc(mean))
+
+cv_summary |>
+  kable(digits = 4,
+        col.names = c("Model", "CV/Train AUROC", "Std. Error", "N folds"),
+        caption = "Cross-validation performance on imputation 1 training set 
+        (Logistic Regression = training AUROC, no CV)")
+```
+
+---
+
+## 8. Fit 5 Models per Algorithm (MI-Correct)
+
+Using best hyperparameters from Section 7, fit each model on all 5 imputed training sets.
+
+```{r finalize-workflows}
+# wf_logit already defined in model-specs chunk above
+final_wf_lr  <- finalize_workflow(wf_lr,  best_lr)
+final_wf_rf  <- finalize_workflow(wf_rf,  best_rf)
+final_wf_xgb <- finalize_workflow(wf_xgb, best_xgb)
+final_wf_svm <- finalize_workflow(wf_svm, best_svm)
+```
+
+```{r fit-all-imputations}
+# Fit one workflow on one imputed training dataset
+fit_on_imp <- function(wf, imp_num) {
+  train_i <- train_stack |>
+    filter(.imp == imp_num) |>
+    select(-stay_id, -.imp)
+  fit(wf, data = train_i)
+}
+
+# Fit 5 x Logistic Regression
+fits_logit <- map(1:5, \(i) fit_on_imp(wf_logit,i))
+
+# Fit 5 x LASSO models
+fits_lr <- map(1:5, \(i) fit_on_imp(final_wf_lr,i))
+
+# Fit 5 x Random Forest models
+fits_rf <- map(1:5, \(i) fit_on_imp(final_wf_rf,i))
+
+# Fitt 5 x XGBoost models
+fits_xgb <- map(1:5, \(i) fit_on_imp(final_wf_xgb,i))
+
+# Fit 5 x SVM models
+fits_svm <- map(1:5, \(i) fit_on_imp(final_wf_svm,  i))
+
+```
+
+---
+
+## 9. Pooled Predictions on Test Set
+
+For each patient in the test set, we generate 5 predicted probabilities (one per imputed test dataset) and average them. This implements Rubin's rule adapted for predicted probabilities.
+
+```{r pool-predictions}
+# True outcomes from test set (identical across all .imp)
+test_true <- test_stack |>
+  filter(.imp == 1) |>
+  select(stay_id, aki_stage2_7d)
+
+# Get predicted P(AKI) from imputation i using a list of 5 fitted models
+get_test_probs <- function(fit_list, imp_num) {
+  test_i <- test_stack |>
+    filter(.imp == imp_num) |>
+    select(-stay_id, -.imp)
+
+  predict(fit_list[[imp_num]], test_i, type = "prob") |>
+    pull(.pred_AKI)
+}
+
+# Average predicted probs across 5 imputations
+pool_predictions <- function(fit_list, model_name) {
+  prob_mat <- map(1:5, \(i) get_test_probs(fit_list, i)) |>
+    bind_cols() |>
+    setNames(paste0("imp", 1:5))
+
+  test_true |>
+    bind_cols(prob_mat) |>
+    mutate(
+      .pred_AKI = rowMeans(across(starts_with("imp"))),
+      model = model_name
+    ) |>
+    select(stay_id, aki_stage2_7d, .pred_AKI, model)
+}
+
+pred_logit <- pool_predictions(fits_logit, "Logistic Regression")
+pred_lr <- pool_predictions(fits_lr,    "LASSO")
+pred_rf <- pool_predictions(fits_rf,    "Random Forest")
+pred_xgb <- pool_predictions(fits_xgb,  "XGBoost")
+pred_svm <- pool_predictions(fits_svm,  "SVM")
+
+all_preds <- bind_rows(pred_logit, pred_lr, pred_rf, pred_xgb, pred_svm)
+
+cat("Pooled predictions shape:", nrow(all_preds), "rows x", 
+    ncol(all_preds), "cols\n")
+cat("Expected:", n_distinct(test_true$stay_id) * 5, 
+    "rows (test patients × 5 models)\n")
+```
+
+---
+
+## 9b. DeLong's Test: XGBoost vs Logistic Regression
+
+```{r delong_test}
+# Extract pooled predictions per model
+preds_xgb <- all_preds |> filter(model == "XGBoost")
+preds_logit <- all_preds |> filter(model == "Logistic Regression")
+
+# Build ROC objects (response: 1 = AKI, 0 = No AKI)
+true_labels_xgb <- as.numeric(preds_xgb$aki_stage2_7d == "AKI")
+true_labels_logit <- as.numeric(preds_logit$aki_stage2_7d == "AKI")
+
+roc_xgb <- pROC::roc(true_labels_xgb,   preds_xgb$.pred_AKI, quiet = TRUE)
+roc_logit <- pROC::roc(true_labels_logit, preds_logit$.pred_AKI, quiet = TRUE)
+
+# DeLong's test (two-sided)
+delong_result <- pROC::roc.test(roc_xgb, roc_logit, method = "delong")
+
+cat("XGBoost AUROC: ", round(auc(roc_xgb), 4), "\n")
+cat("Logistic Regression AUROC: ", round(auc(roc_logit), 4), "\n")
+cat("DeLong's test Z =", round(delong_result$statistic, 3),
+    "  P =", round(delong_result$p.value, 4), "\n")
+```
+
+---
+
+## 10. Evaluation Metrics
+
+### 10.1 AUROC
+
+```{r auroc}
+roc_results <- all_preds |>
+  group_by(model) |>
+  roc_auc(truth = aki_stage2_7d, .pred_AKI, event_level = "first") |>
+  rename(AUROC = .estimate) |>
+  select(model, AUROC) |>
+  arrange(desc(AUROC))
+
+roc_results |>
+  kable(digits = 4, caption = "AUROC by model 
+        (test set, pooled MI predictions)")
+```
+
+### 10.2 AUPRC (Precision-Recall AUC)
+
+```{r auprc}
+pr_results <- all_preds |>
+  group_by(model) |>
+  pr_auc(truth = aki_stage2_7d, .pred_AKI, event_level = "first") |>
+  rename(AUPRC = .estimate) |>
+  select(model, AUPRC)
+
+pr_results |>
+  kable(digits = 4, caption = "AUPRC by model")
+```
+
+### 10.3 Brier Score
+
+```{r brier}
+brier_results <- all_preds |>
+  mutate(outcome_bin = as.integer(aki_stage2_7d == "AKI")) |>
+  group_by(model) |>
+  summarise(
+    Brier = round(mean((.pred_AKI - outcome_bin)^2), 4),
+    .groups = "drop"
+  )
+
+brier_results |>
+  kable(digits = 4, caption = "Brier Score by model 
+        (lower = better; 0.25 = uninformative)")
+```
+
+### 10.4 Optimal Threshold via Youden's J
+
+```{r threshold-youden}
+threshold_results <- all_preds |>
+  group_by(model) |>
+  threshold_perf(
+    truth = aki_stage2_7d,
+    estimate = .pred_AKI,
+    thresholds = seq(0.05, 0.95, by = 0.01),
+    event_level = "first",
+    metrics = metric_set(sens, spec, j_index)
+  ) |>
+  filter(.metric == "j_index") |>
+  group_by(model) |>
+  slice_max(.estimate, n = 1, with_ties = FALSE) |>
+  select(model, optimal_threshold = .threshold, j_index = .estimate)
+
+threshold_results |>
+  kable(digits = 3, caption = "Optimal classification threshold by Youden's J")
+```
+
+### 10.5 Confusion Matrix at Optimal Threshold
+
+```{r confusion-matrix}
+preds_with_threshold <- all_preds |>
+  left_join(threshold_results, by = "model") |>
+  mutate(
+    .pred_class = factor(
+      if_else(.pred_AKI >= optimal_threshold, "AKI", "No_AKI"),
+      levels = c("AKI", "No_AKI")
+    )
+  )
+
+# Print confusion matrix for each model
+for (mod in unique(all_preds$model)) {
+  cat("\n--- Confusion Matrix:", mod, "---\n")
+  cm <- preds_with_threshold |>
+    filter(model == mod) |>
+    conf_mat(truth = aki_stage2_7d, estimate = .pred_class)
+  print(cm)
+  cat("Sensitivity:", round(cm$table[1,1] / (cm$table[1,1] + 
+                                                     cm$table[2,1]), 3), "\n")
+  cat("Specificity:", round(cm$table[2,2] / (cm$table[1,2] + 
+                                                     cm$table[2,2]), 3), "\n")
+}
+```
+
+### 10.6 Combined Performance Table
+
+```{r performance-table}
+performance_table <- roc_results |>
+  left_join(pr_results, by = "model") |>
+  left_join(brier_results, by = "model") |>
+  left_join(threshold_results, by = "model") |>
+  arrange(desc(AUROC))
+
+performance_table |>
+  kable(
+    digits = 4,
+    col.names = c("Model", "AUROC", "AUPRC", "Brier Score",
+                  "Optimal Threshold", "Youden's J"),
+    caption = "Table 1: ML Model Performance on Held-Out Test Set 
+    (Pooled MI Predictions)"
+  )
+```
+
+---
+
+## 11. Figures
+
+### Figure 1: ROC Curves
+
+```{r fig-roc, fig.height=6, fig.width=8}
+roc_curves <- all_preds |>
+  group_by(model) |>
+  roc_curve(truth = aki_stage2_7d, .pred_AKI, event_level = "first")
+
+roc_label <- roc_results |>
+  mutate(label = paste0(model, " (AUC = ", round(AUROC, 3), ")")) |>
+  select(model, label)
+
+roc_plot <- roc_curves |>
+  left_join(roc_label, by = "model") |>
+  ggplot(aes(x = 1 - specificity, y = sensitivity, color = label)) +
+  geom_path(linewidth = 1.0) +
+  geom_abline(linetype = "dashed", color = "grey60") +
+  scale_color_brewer(palette = "Set1", name = NULL) +
+  coord_equal() +
+  labs(
+    title = "ROC Curves — AKI Stage 2+ Prediction",
+    subtitle = "Predictions pooled across 5 MICE imputations",
+    x = "1 - Specificity (False Positive Rate)",
+    y = "Sensitivity (True Positive Rate)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = c(0.65, 0.2),
+    legend.background = element_rect(fill = "white", color = NA),
+    plot.title = element_text(face = "bold")
+  )
+
+roc_plot
+```
+
+### Figure 2: Precision-Recall Curves
+
+```{r fig-pr, fig.height=6, fig.width=8}
+pr_curves <- all_preds |>
+  group_by(model) |>
+  pr_curve(truth = aki_stage2_7d, .pred_AKI, event_level = "first")
+
+pr_label <- pr_results |>
+  mutate(label = paste0(model, " (AUPRC = ", round(AUPRC, 3), ")")) |>
+  select(model, label)
+
+# Baseline: outcome prevalence
+prev <- mean(all_preds$aki_stage2_7d[all_preds$model == "LASSO"] == "AKI")
+
+pr_plot <- pr_curves |>
+  left_join(pr_label, by = "model") |>
+  ggplot(aes(x = recall, y = precision, color = label)) +
+  geom_path(linewidth = 1.0) +
+  geom_hline(yintercept = prev, linetype = "dashed", color = "grey60") +
+  annotate("text", x = 0.85, y = prev + 0.02,
+           label = paste0("Baseline (", round(prev * 100, 1), "%)"),
+           size = 3.5, color = "grey40") +
+  scale_color_brewer(palette = "Set1", name = NULL) +
+  coord_cartesian(xlim = c(0, 1), ylim = c(0, 1)) +
+  labs(
+    title = "Precision-Recall Curves — AKI Stage 2+ Prediction",
+    subtitle = "Dashed line = no-skill baseline (outcome prevalence)",
+    x = "Recall (Sensitivity)",
+    y = "Precision (PPV)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = c(0.7, 0.8),
+    legend.background = element_rect(fill = "white", color = NA),
+    plot.title = element_text(face = "bold")
+  )
+
+pr_plot
+```
+
+### Figure 3: Calibration Plots
+
+```{r fig-calibration, fig.height=8, fig.width=10}
+calibration_df <- all_preds |>
+  mutate(outcome_bin = as.integer(aki_stage2_7d == "AKI")) |>
+  group_by(model) |>
+  mutate(bin = cut(.pred_AKI,
+                   breaks = seq(0, 1, by = 0.1),
+                   include.lowest = TRUE, right = FALSE)) |>
+  group_by(model, bin) |>
+  summarise(
+    mean_pred = mean(.pred_AKI),
+    mean_obs = mean(outcome_bin),
+    n = n(),
+    .groups = "drop"
+  ) |>
+  filter(n >= 10)
+
+ggplot(calibration_df, aes(x = mean_pred, y = mean_obs)) +
+  geom_abline(linetype = "dashed", color = "grey60") +
+  geom_point(aes(size = n), color = "#2c7bb6", alpha = 0.8) +
+  geom_line(color = "#2c7bb6", alpha = 0.6) +
+  scale_size_continuous(range = c(2, 8), name = "N in bin") +
+  coord_equal(xlim = c(0, 1), ylim = c(0, 1)) +
+  facet_wrap(~ model, ncol = 2) +
+  labs(
+    title = "Calibration Plots — Predicted vs. Observed Probability",
+    subtitle = "Each point = decile bin; dashed = perfect calibration",
+    x = "Mean Predicted Probability",
+    y = "Observed Event Rate"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+### Figure 4: LASSO — Top Non-Zero Coefficients
+
+```{r fig-lasso-coefs, fig.height=7, fig.width=9}
+lasso_coefs <- fits_lr[[1]] |>
+  extract_fit_parsnip() |>
+  tidy() |>
+  filter(term != "(Intercept)", estimate != 0) |>
+  mutate(direction = if_else(estimate > 0, "Positive (risk)", 
+                             "Negative (protective)")) |>
+  arrange(desc(abs(estimate))) |>
+  slice_head(n = 25)
+
+ggplot(lasso_coefs, aes(x = reorder(term, abs(estimate)), y = estimate, 
+                        fill = direction)) +
+  geom_col(show.legend = TRUE) +
+  scale_fill_manual(values = c("Positive (risk)" = "#e74c3c",
+                               "Negative (protective)" = "#3498db"),
+                    name = NULL) +
+  coord_flip() +
+  labs(
+    title = "LASSO: Top Non-Zero Coefficients",
+    subtitle = "Imputation 1; positive = increased AKI risk",
+    x = NULL,
+    y = "Coefficient Estimate"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"),
+        legend.position = "bottom")
+```
+
+### Figure 5: Random Forest — Feature Importance
+
+```{r fig-rf-importance, fig.height=7, fig.width=9}
+rf_importance <- map_dfr(1:5, function(i) {
+  fits_rf[[i]] |>
+    extract_fit_parsnip() |>
+    pluck("fit") |>
+    (\(m) tibble(
+      variable = names(m$variable.importance),
+      importance = m$variable.importance
+    ))() |>
+    mutate(.imp = i)
+}) |>
+  group_by(variable) |>
+  summarise(mean_importance = mean(importance), .groups = "drop") |>
+  arrange(desc(mean_importance)) |>
+  slice_head(n = 25)
+
+ggplot(rf_importance, aes(x = reorder(variable, mean_importance), 
+                          y = mean_importance)) +
+  geom_col(fill = "#27ae60") +
+  coord_flip() +
+  labs(
+    title = "Random Forest: Top 25 Features by Mean Gini Importance",
+    subtitle = "Averaged across 5 MICE imputations",
+    x = NULL,
+    y = "Mean Impurity (Gini) Importance"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+### Figure 6: XGBoost — Feature Importance (Gain)
+
+```{r fig-xgb-importance, fig.height=7, fig.width=9}
+xgb_importance <- map_dfr(1:5, function(i) {
+  fits_xgb[[i]] |>
+    extract_fit_parsnip() |>
+    pluck("fit") |>
+    xgb.importance(model = _) |>
+    as_tibble() |>
+    mutate(.imp = i)
+}) |>
+  group_by(Feature) |>
+  summarise(mean_gain = mean(Gain), .groups = "drop") |>
+  arrange(desc(mean_gain)) |>
+  slice_head(n = 25)
+
+ggplot(xgb_importance, aes(x = reorder(Feature, mean_gain), y = mean_gain)) +
+  geom_col(fill = "#e67e22") +
+  coord_flip() +
+  labs(
+    title = "XGBoost: Top 25 Features by Mean Gain",
+    subtitle = "Averaged across 5 MICE imputations",
+    x = NULL,
+    y = "Mean Gain"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+---
+
+## 12. Save Outputs
+
+```{r save-outputs}
+saveRDS(all_preds, "ml_predictions_pooled.rds")
+write_csv(performance_table, "ml_performance_table.csv")
+saveRDS(
+  list(logit = fits_logit, lr = fits_lr, rf = fits_rf, xgb = fits_xgb, 
+       svm = fits_svm),
+  "ml_fitted_models.rds"
+)
+
+cat("Saved:\n")
+cat("  ml_predictions_pooled.rds\n")
+cat("  ml_performance_table.csv\n")
+cat("  ml_fitted_models.rds\n")
+```
+
+---
+
+## Session Info
+
+```{r session-info}
+sessionInfo()
+```

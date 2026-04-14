@@ -1,0 +1,771 @@
+---
+title: "MIMIC-IV: AKI in Mechanically Ventilated Patients (v2 — Imputed Baseline)"
+author: "Rica Pitogo"
+date: "`r Sys.Date()`"
+output: html_document
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## Setting up libraries
+```{r include=FALSE}
+library(tidyverse)
+library(lubridate)
+library(ggplot2)
+library(scales)
+library(patchwork)
+library(duckdb)
+
+mimic_path <- path.expand("~/mimic/")
+```
+
+## Loading the data
+```{r}
+# Core demographic and stay information
+
+# Patients
+patients <- read_csv(paste0(mimic_path, "hosp/patients.csv.gz"))
+
+# Admissions
+admissions <- read_csv(paste0(mimic_path, "hosp/admissions.csv.gz")) %>%
+  filter(!is.na(admittime))
+
+# ICU stays
+icustays <- read_csv(paste0(mimic_path, "icu/icustays.csv.gz")) %>%
+  filter(!is.na(intime))
+```
+
+```{r}
+# ICU item dictionary
+d_items <- read_csv(paste0(mimic_path, "icu/d_items.csv.gz"))
+
+# Procedure data
+procedureevents <- read_csv(paste0(mimic_path, "icu/procedureevents.csv.gz")) %>%
+  filter(!is.na(starttime))
+
+# Diagnoses data
+diagnoses_icd <- read_csv(paste0(mimic_path, "hosp/diagnoses_icd.csv.gz"))
+```
+
+## Load Laboratory Data (Including Creatinine)
+```{r}
+# Explicit itemid → lab_category mapping (verified MIMIC-IV itemids)
+# Multi-code labs:
+#   lactate: 3 codes (arterial/venous/whole blood — same measurement, pooled)
+#   ph/pao2/paco2: arterial blood gas only (required for P/F ratio and SOFA)
+#   bilirubin: total only (51966; direct bilirubin 51464 excluded — SOFA uses total)
+lab_itemids <- tribble(
+  ~lab_category,   ~itemid,
+  "creatinine",    50912,
+  "bun",           51842,
+  "potassium",     50971,
+  "sodium",        50983,
+  "bicarbonate",   50882,
+  "hemoglobin",    51222,
+  "hematocrit",    51221,
+  "platelet",      51265,
+  "wbc",           51301,
+  "albumin",       50862,
+  "lactate",       50813,
+  "lactate",       52442,
+  "lactate",       53154,
+  "glucose",       50931,
+  "chloride",      50902,
+  "calcium",       50893,
+  "magnesium",     50960,
+  "phosphate",     50970,
+  "ph",            50820,
+  "pao2",          50821,
+  "paco2",         50818,
+  "bnp",           51921,
+  "troponin",      51003,
+  "bilirubin",     50885,
+  "inr",           51237,
+  "prothrombin",   51274,
+  "ptt",           51275,
+  "fibrinogen",    51214
+)
+
+# Query labevents using DuckDB
+aki_itemids_str <- paste(lab_itemids$itemid, collapse = ",")
+con <- dbConnect(duckdb::duckdb(), ":memory:")
+
+aki_labs <- dbGetQuery(con, sprintf("
+  SELECT
+    subject_id,
+    hadm_id,
+    charttime,
+    storetime,
+    itemid,
+    valuenum,
+    valueuom
+  FROM read_csv_auto('%shosp/labevents.csv.gz')
+  WHERE itemid IN (%s)
+    AND valuenum IS NOT NULL
+", mimic_path, aki_itemids_str))
+
+dbDisconnect(con, shutdown = TRUE)
+
+# Parse and clean
+aki_labs <- aki_labs %>%
+  left_join(
+          lab_itemids %>% select(itemid, lab_category),
+          by = "itemid") %>%
+  mutate(
+          charttime = parse_date_time(
+                  charttime, orders = c("ymd HMS", "ymd HM", "ymd"),
+                  quiet = TRUE)) %>%
+  filter(!is.na(charttime)) %>%
+  mutate(
+          storetime = parse_date_time(
+                  storetime, orders = c("ymd HMS", "ymd HM", "ymd"),
+                  quiet = TRUE)) %>%
+  filter(!is.na(storetime))
+
+# Extract creatinine specifically
+creatinine <- aki_labs %>%
+  filter(lab_category == "creatinine") %>%
+  select(subject_id, hadm_id, charttime, storetime, creat = valuenum) %>%
+  filter(creat > 0, creat < 20)
+
+cat(sprintf("Loaded %s creatinine measurements\n",
+            format(nrow(creatinine), big.mark=",")))
+
+# Save for later use
+saveRDS(aki_labs, "aki_labs_long.rds")
+```
+
+## Identify Mechanical Ventilation
+```{r}
+# Find ventilation-related procedure codes
+ vent_items <- d_items %>%
+  filter(
+    grepl("ventilat|intubat|extubat", label, ignore.case = TRUE) |
+    grepl("invasive vent", label, ignore.case = TRUE)
+  ) %>%
+  select(itemid, label, category)
+
+# Get ventilation events for each ICU stay
+vent_stays <- procedureevents %>%
+  filter(itemid %in% vent_items$itemid) %>%
+  filter(!is.na(starttime), !is.na(endtime)) %>%
+  group_by(stay_id) %>%
+  summarise(
+    vent_start = min(starttime, na.rm = TRUE),
+    vent_end = max(endtime, na.rm = TRUE),
+    n_vent_events = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    vent_duration_hours = as.numeric(difftime(vent_end,
+                                              vent_start, units = "hours"))
+  ) %>%
+  filter(is.finite(vent_duration_hours))
+
+cat(sprintf("Found %s mechanically ventilated ICU stays\n",
+            format(nrow(vent_stays), big.mark=",")))
+```
+
+## Build Initial Cohort (Basic Inclusion Criteria)
+```{r}
+cohort_step1 <- vent_stays %>%
+  inner_join(icustays, by = "stay_id") %>%
+  inner_join(admissions, by = c("subject_id", "hadm_id")) %>%
+  inner_join(patients, by = "subject_id") %>%
+  mutate(
+    age = year(admittime) - anchor_year + anchor_age,
+    icu_los_days = as.numeric(difftime(outtime, intime, units = "days")),
+    hosp_los_days = as.numeric(difftime(dischtime, admittime, units = "days"))
+  ) %>%
+  filter(
+    age >= 18,
+    vent_duration_hours >= 24,
+    !is.na(icu_los_days),
+    !is.na(hosp_los_days),
+    !is.na(age)
+  )
+
+cat(sprintf("Initial cohort: %s ICU stays\n",
+            format(nrow(cohort_step1), big.mark=",")))
+cat(sprintf("                %s unique patients\n\n",
+            format(n_distinct(cohort_step1$subject_id), big.mark=",")))
+```
+
+## Exclusion #1 - ESRD/Kidney Transplant
+```{r}
+cat("=== EXCLUSION #1: ESRD/Kidney Transplant ===\n\n")
+
+# ICD-9 codes (MIMIC-IV stores ICD-9 codes WITHOUT decimal points)
+esrd_icd9 <- c(
+  "5856",    # End stage renal disease
+  "V451",    # Renal dialysis status
+  "V4511",   # Renal transplant status
+  "V560",    # Extracorporeal dialysis
+  "V561",    # Fitting of dialysis catheter
+  "V562",    # Peritoneal dialysis catheter
+  "V568"     # Other dialysis
+)
+
+# ICD-10 codes
+esrd_icd10 <- c(
+  "N18.6",   # End stage renal disease
+  "Z94.0",   # Kidney transplant status
+  "Z99.2"    # Dependence on renal dialysis
+)
+
+# Find patients with these diagnoses
+esrd_patients <- diagnoses_icd %>%
+  filter(
+    (icd_version == 9 & icd_code %in% esrd_icd9) |
+    (icd_version == 10 & icd_code %in% esrd_icd10)
+  ) %>%
+  distinct(subject_id)
+
+cat(sprintf("Found %s patients with ESRD/transplant\n",
+            format(nrow(esrd_patients), big.mark=",")))
+
+# Apply exclusion
+cohort_step2 <- cohort_step1 %>%
+  anti_join(esrd_patients, by = "subject_id")
+
+n_excluded <- nrow(cohort_step1) - nrow(cohort_step2)
+
+cat(sprintf("\nExcluded: %s ICU stays\n", format(n_excluded, big.mark=",")))
+cat(sprintf("Remaining: %s ICU stays (%.1f%% of initial)\n\n",
+            format(nrow(cohort_step2), big.mark=","),
+            (nrow(cohort_step2) / nrow(cohort_step1)) * 100))
+```
+
+## Exclusion #2 - Elective Surgical Admissions
+```{r}
+cat("=== EXCLUSION #2: Elective Surgical Admissions ===\n\n")
+
+cat("Admission types in current cohort:\n")
+cohort_step2 %>%
+  count(admission_type) %>%
+  arrange(desc(n)) %>%
+  mutate(percent = (n / sum(n)) * 100) %>%
+  print()
+
+cat("\nExcluding: ELECTIVE and SURGICAL SAME DAY ADMISSION\n")
+
+cohort_step3 <- cohort_step2 %>%
+  filter(!admission_type %in% c("ELECTIVE", "SURGICAL SAME DAY ADMISSION"))
+
+n_excluded <- nrow(cohort_step2) - nrow(cohort_step3)
+
+cat(sprintf("\nExcluded: %s ICU stays\n", format(n_excluded, big.mark=",")))
+cat(sprintf("Remaining: %s ICU stays (%.1f%% of initial)\n\n",
+            format(nrow(cohort_step3), big.mark=","),
+            (nrow(cohort_step3) / nrow(cohort_step1)) * 100))
+```
+
+## Exclusion #3 - Death Within 48 Hours
+```{r}
+cat("=== EXCLUSION #3: Death Within 48 Hours of Intubation ===\n\n")
+
+cohort_step4 <- cohort_step3 %>%
+  mutate(
+    hours_to_death = if_else(
+      !is.na(deathtime),
+      as.numeric(difftime(deathtime, vent_start, units = "hours")),
+      NA_real_
+    ),
+    died_within_48h = !is.na(hours_to_death) &
+                      hours_to_death >= 0 &
+                      hours_to_death <= 48
+  )
+
+# Show breakdown
+cat("Death timing:\n")
+cohort_step3 %>%
+  mutate(
+    hours_to_death = if_else(
+      !is.na(deathtime),
+      as.numeric(difftime(deathtime, vent_start, units = "hours")),
+      NA_real_
+    ),
+    died_within_48h = !is.na(hours_to_death) &
+            hours_to_death >= 0 & hours_to_death <= 48
+  ) %>%
+  summarise(
+    total_deaths = sum(!is.na(deathtime)),
+    deaths_within_48h = sum(died_within_48h, na.rm = TRUE),
+    deaths_after_48h = sum(!is.na(hours_to_death) &
+                                   hours_to_death > 48, na.rm = TRUE)
+  ) %>%
+  print()
+
+# Apply exclusion
+cohort_step4 <- cohort_step4 %>%
+  filter(!died_within_48h)
+
+n_excluded <- nrow(cohort_step3) - nrow(cohort_step4)
+
+cat(sprintf("\nExcluded: %s ICU stays\n", format(n_excluded, big.mark=",")))
+cat(sprintf("Remaining: %s ICU stays (%.1f%% of initial)\n\n",
+            format(nrow(cohort_step4), big.mark=","),
+            (nrow(cohort_step4) / nrow(cohort_step1)) * 100))
+```
+
+## Exclusion #4 - Baseline Creatinine (Observed + Imputed) & Exclude AKI Stage 2+
+```{r}
+cat("=== EXCLUSION #4: Baseline Creatinine & AKI Stage 2+ ===\n\n")
+cat("VERSION 2: Missing baseline creatinine is IMPUTED via CKD-EPI 2021\n")
+cat("           back-solved at assumed GFR = 90 mL/min/1.73m²\n\n")
+
+#============================================================================
+# STEP 4A: Calculate Observed Baseline Creatinine
+# Definition: Median creatinine from 7-365 days before admission
+#============================================================================
+
+cat("Step 4A: Calculating baseline creatinine (observed + imputed)...\n")
+cat("Observed: MEDIAN creatinine from 7-365 days before hospital admission\n")
+cat("Imputed:  CKD-EPI 2021 back-calculation at GFR = 90 (age + sex)\n\n")
+
+# --- 4A-i: Observed baseline ---
+observed_baseline <- cohort_step4 %>%
+  select(subject_id, hadm_id, stay_id, admittime) %>%
+  inner_join(
+    creatinine %>% select(subject_id, charttime, creat),
+    by = "subject_id",
+    relationship = "many-to-many"
+  ) %>%
+  mutate(
+    days_before_admit = as.numeric(difftime(admittime, charttime,
+                                            units = "days"))
+  ) %>%
+  filter(
+    days_before_admit >= 7,
+    days_before_admit <= 365
+  ) %>%
+  group_by(stay_id) %>%
+  summarise(
+    baseline_creat       = median(creat, na.rm = TRUE),
+    n_baseline_measures  = n(),
+    earliest_measure_days = max(days_before_admit, na.rm = TRUE),
+    latest_measure_days   = min(days_before_admit, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(baseline_source = "observed")
+
+cat(sprintf("  Stays with OBSERVED baseline creatinine: %s / %s (%.1f%%)\n",
+            format(nrow(observed_baseline), big.mark = ","),
+            format(nrow(cohort_step4),      big.mark = ","),
+            nrow(observed_baseline) / nrow(cohort_step4) * 100))
+
+# --- 4A-ii: CKD-EPI 2021 back-calculation function ---
+# GFR = 142 * min(Scr/k,1)^alpha * max(Scr/k,1)^-1.2 * 0.9938^Age * (1.012 if F)
+# Back-solve for Scr at GFR = 90
+impute_baseline_creat_ckdepi <- function(age, gender, gfr = 90) {
+  female    <- gender == "F"
+  kappa     <- ifelse(female, 0.7,    0.9)
+  alpha     <- ifelse(female, -0.241, -0.302)
+  f_fac     <- ifelse(female, 1.012,  1.0)
+
+  gfr_adj   <- gfr / (142 * 0.9938^age * f_fac)
+
+  # Case 1: Scr <= kappa  →  Scr = kappa * GFR_adj^(1/alpha)
+  scr_case1 <- kappa * gfr_adj^(1 / alpha)
+  # Case 2: Scr > kappa   →  Scr = kappa * GFR_adj^(-1/1.2)
+  scr_case2 <- kappa * gfr_adj^(-1 / 1.2)
+
+  # Pick self-consistent solution
+  ifelse(scr_case1 <= kappa, scr_case1, scr_case2)
+}
+
+# --- 4A-iii: Impute for stays missing observed baseline ---
+stays_missing_baseline <- cohort_step4 %>%
+  anti_join(observed_baseline, by = "stay_id") %>%
+  select(stay_id, age, gender)
+
+imputed_baseline <- stays_missing_baseline %>%
+  mutate(
+    baseline_creat      = impute_baseline_creat_ckdepi(age, gender, gfr = 90),
+    n_baseline_measures = 0L,
+    baseline_source     = "imputed"
+  ) %>%
+  select(stay_id, baseline_creat, n_baseline_measures, baseline_source)
+
+cat(sprintf("  Stays with IMPUTED baseline creatinine: %s (%.1f%%)\n\n",
+            format(nrow(imputed_baseline), big.mark = ","),
+            nrow(imputed_baseline) / nrow(cohort_step4) * 100))
+
+# --- 4A-iv: Combine observed + imputed ---
+baseline_creatinine <- bind_rows(
+  observed_baseline %>% select(stay_id, baseline_creat,
+                                n_baseline_measures, baseline_source),
+  imputed_baseline
+)
+
+cat("Baseline creatinine summary by source:\n")
+baseline_creatinine %>%
+  group_by(baseline_source) %>%
+  summarise(
+    n       = n(),
+    mean_cr = round(mean(baseline_creat, na.rm = TRUE), 3),
+    median_cr = round(median(baseline_creat, na.rm = TRUE), 3),
+    sd_cr   = round(sd(baseline_creat, na.rm = TRUE), 3),
+    .groups = "drop"
+  ) %>%
+  print()
+
+#============================================================================
+# STEP 4B: All stays now have baseline — report but do not exclude
+#============================================================================
+
+cat("\nStep 4B: Baseline creatinine coverage check...\n")
+cat("  (In v2, missing observed baseline is imputed — no stays excluded here)\n")
+
+n_still_missing <- nrow(cohort_step4) - nrow(baseline_creatinine)
+cat(sprintf("  Stays still missing baseline (e.g., missing age/gender): %s\n",
+            format(n_still_missing, big.mark = ",")))
+
+cohort_step4_with_baseline <- cohort_step4 %>%
+  semi_join(baseline_creatinine, by = "stay_id")
+
+cat(sprintf("  Remaining: %s stays\n\n",
+            format(nrow(cohort_step4_with_baseline), big.mark = ",")))
+
+#============================================================================
+# STEP 4C: Get Peri-Intubation Creatinine
+#============================================================================
+
+cat("Step 4C: Finding creatinine at intubation...\n")
+cat("  Window: 48 hours before to 6 hours after intubation\n\n")
+
+peri_intubation_creat <- cohort_step4_with_baseline %>%
+  select(subject_id, hadm_id, stay_id, vent_start) %>%
+  inner_join(
+    creatinine,
+    by = c("subject_id", "hadm_id"),
+    relationship = "many-to-many"
+  ) %>%
+  mutate(
+    hours_from_vent = as.numeric(difftime(charttime, vent_start,
+                                          units = "hours"))
+  ) %>%
+  filter(
+    hours_from_vent >= -48,
+    hours_from_vent <= 6
+  ) %>%
+  group_by(stay_id) %>%
+  summarise(
+    max_creat_at_intubation = max(creat, na.rm = TRUE),
+    min_creat_at_intubation = min(creat, na.rm = TRUE),
+    n_measures = n(),
+    .groups = "drop"
+  )
+
+cat(sprintf("  Stays with peri-intubation creatinine: %s / %s (%.1f%%)\n\n",
+            format(nrow(peri_intubation_creat), big.mark = ","),
+            format(nrow(cohort_step4_with_baseline), big.mark = ","),
+            nrow(peri_intubation_creat) / nrow(cohort_step4_with_baseline) * 100))
+
+#============================================================================
+# STEP 4C.5: Require Peri-Intubation Creatinine
+#============================================================================
+
+cat("Step 4C.5: Requiring peri-intubation creatinine data...\n")
+
+cohort_step4_with_peri <- cohort_step4_with_baseline %>%
+  semi_join(peri_intubation_creat, by = "stay_id")
+
+n_excluded_no_peri <- nrow(cohort_step4_with_baseline) -
+        nrow(cohort_step4_with_peri)
+cat(sprintf("  Excluded (no peri-intubation creatinine): %s stays\n",
+            format(n_excluded_no_peri, big.mark = ",")))
+cat(sprintf("  Remaining: %s stays\n\n",
+            format(nrow(cohort_step4_with_peri), big.mark = ",")))
+
+#============================================================================
+# STEP 4D: Stage AKI Using KDIGO Criteria
+#============================================================================
+
+cat("Step 4D: Staging AKI at intubation (KDIGO criteria)...\n\n")
+
+aki_at_intubation <- baseline_creatinine %>%
+  inner_join(peri_intubation_creat, by = "stay_id") %>%
+  mutate(
+    creat_fold_increase = max_creat_at_intubation / baseline_creat,
+
+    aki_stage_creat = case_when(
+      creat_fold_increase >= 3.0 ~ "Stage 3",
+      creat_fold_increase >= 2.0 ~ "Stage 2",
+      creat_fold_increase >= 1.5 ~ "Stage 1",
+      TRUE ~ "No AKI"
+    ),
+
+    has_aki_stage2_plus = creat_fold_increase >= 2.0,
+    aki_stage = case_when(
+      creat_fold_increase >= 3.0 ~ "Stage 3",
+      has_aki_stage2_plus           ~ "Stage 2",
+      creat_fold_increase >= 1.5    ~ "Stage 1",
+      TRUE                          ~ "No AKI"
+    )
+  )
+
+cat("  AKI staging distribution (all stays with peri-intubation creatinine):\n")
+aki_summary <- aki_at_intubation %>%
+  count(aki_stage) %>%
+  mutate(
+    percent = (n / sum(n)) * 100,
+    aki_stage = factor(aki_stage,
+                       levels = c("No AKI", "Stage 1", "Stage 2", "Stage 3"))
+  ) %>%
+  arrange(aki_stage)
+
+print(aki_summary)
+
+cat("\n  AKI staging by baseline source:\n")
+aki_at_intubation %>%
+  count(baseline_source, aki_stage) %>%
+  mutate(aki_stage = factor(aki_stage,
+                            levels = c("No AKI", "Stage 1", "Stage 2", "Stage 3"))) %>%
+  arrange(baseline_source, aki_stage) %>%
+  print()
+
+#============================================================================
+# STEP 4E: Exclude AKI Stage 2+
+#============================================================================
+
+cat("\nStep 4E: Excluding AKI Stage 2+...\n")
+
+stays_with_aki_stage2_plus <- aki_at_intubation %>%
+  filter(has_aki_stage2_plus) %>%
+  select(stay_id)
+
+cat(sprintf("  Identified %s stays with AKI Stage 2+\n",
+            format(nrow(stays_with_aki_stage2_plus), big.mark = ",")))
+
+cohort_final <- cohort_step4_with_peri %>%
+  anti_join(stays_with_aki_stage2_plus, by = "stay_id")
+
+n_excluded_aki <- nrow(cohort_step4_with_peri) - nrow(cohort_final)
+
+cat(sprintf("\n  Excluded: %s ICU stays\n", format(n_excluded_aki, big.mark = ",")))
+cat(sprintf("  FINAL COHORT: %s ICU stays (%.1f%% of initial)\n\n",
+            format(nrow(cohort_final), big.mark = ","),
+            (nrow(cohort_final) / nrow(cohort_step1)) * 100))
+
+#============================================================================
+# Verification
+#============================================================================
+
+cat("=== Verification ===\n")
+
+final_with_aki_stage <- cohort_final %>%
+  left_join(aki_at_intubation %>%
+                    select(stay_id, aki_stage, baseline_creat,
+                           baseline_source, max_creat_at_intubation,
+                           creat_fold_increase, n_baseline_measures),
+            by = "stay_id")
+
+cat("AKI stage distribution in FINAL cohort:\n")
+final_with_aki_stage %>%
+  count(aki_stage) %>%
+  mutate(percent = (n / sum(n)) * 100) %>%
+  print()
+
+cat("\nBaseline source in FINAL cohort:\n")
+final_with_aki_stage %>%
+  count(baseline_source) %>%
+  mutate(percent = (n / sum(n)) * 100) %>%
+  print()
+
+cat(sprintf("\nTotal in final cohort: %s\n", format(nrow(cohort_final), big.mark = ",")))
+cat(sprintf("All have baseline creatinine: %s\n",
+            all(!is.na(final_with_aki_stage$baseline_creat))))
+cat(sprintf("All have No AKI or Stage 1 only: %s\n\n",
+            all(final_with_aki_stage$aki_stage %in% c("No AKI", "Stage 1"))))
+```
+
+## Final Cohort Summary Statistics
+```{r}
+# Rename for consistency
+cohort <- cohort_final
+
+# Calculate summary statistics
+cohort_summary <- cohort %>%
+  summarise(
+    N_ICU_Stays = n(),
+    N_Unique_Patients = n_distinct(subject_id),
+    Mean_Age = mean(age, na.rm = TRUE),
+    SD_Age = sd(age, na.rm = TRUE),
+    Median_Age = median(age, na.rm = TRUE),
+    Percent_Female = mean(gender == "F", na.rm = TRUE) * 100,
+    Median_ICU_LOS_Days = median(icu_los_days, na.rm = TRUE),
+    IQR_ICU_LOS_Days = paste0(
+      round(quantile(icu_los_days, 0.25, na.rm = TRUE), 1),
+      " - ",
+      round(quantile(icu_los_days, 0.75, na.rm = TRUE), 1)
+    ),
+    Median_Vent_Hours = median(vent_duration_hours, na.rm = TRUE),
+    IQR_Vent_Hours = paste0(
+      round(quantile(vent_duration_hours, 0.25, na.rm = TRUE), 1),
+      " - ",
+      round(quantile(vent_duration_hours, 0.75, na.rm = TRUE), 1)
+    ),
+    Hospital_Mortality_Percent = mean(hospital_expire_flag == 1,
+                                      na.rm = TRUE) * 100
+  )
+
+# Print nicely
+cat("Sample Size:\n")
+cat(sprintf("  ICU Stays: %s\n", format(cohort_summary$N_ICU_Stays, big.mark = ",")))
+cat(sprintf("  Unique Patients: %s\n\n",
+            format(cohort_summary$N_Unique_Patients, big.mark = ",")))
+
+cat("Demographics:\n")
+cat(sprintf("  Age: %.1f ± %.1f years (median: %.1f)\n",
+            cohort_summary$Mean_Age, cohort_summary$SD_Age,
+            cohort_summary$Median_Age))
+cat(sprintf("  Female: %.1f%%\n\n", cohort_summary$Percent_Female))
+
+cat("Clinical Characteristics:\n")
+cat(sprintf("  ICU Length of Stay: %.1f days (IQR: %s)\n",
+            cohort_summary$Median_ICU_LOS_Days,
+            cohort_summary$IQR_ICU_LOS_Days))
+cat(sprintf("  Ventilation Duration: %.1f hours (IQR: %s)\n",
+            cohort_summary$Median_Vent_Hours, cohort_summary$IQR_Vent_Hours))
+cat(sprintf("  Hospital Mortality: %.1f%%\n\n",
+            cohort_summary$Hospital_Mortality_Percent))
+
+# Save cohort
+saveRDS(cohort, "final_cohort_imputed_baseline.rds")
+cat("Final cohort saved to 'final_cohort_imputed_baseline.rds'\n")
+```
+
+## Visualizations
+
+### 1. Exclusion Flow Diagram
+```{r exclusion-flow, fig.width=10, fig.height=7}
+# Create exclusion flow data
+exclusion_flow <- data.frame(
+  Step = c(
+    "Initial cohort\n(≥18y, ≥24h vent)",
+    "After excluding\nESRD/transplant",
+    "After excluding\nelective surgical",
+    "After excluding\ndeath <48h",
+    "After baseline Cr\n(observed + imputed)",
+    "After requiring\nperi-intubation creatinine",
+    "FINAL COHORT\n(after AKI Stage 2+ exclusion)"
+  ),
+  N_Stays = c(
+    nrow(cohort_step1),
+    nrow(cohort_step2),
+    nrow(cohort_step3),
+    nrow(cohort_step4),
+    nrow(cohort_step4_with_baseline),
+    nrow(cohort_step4_with_peri),
+    nrow(cohort_final)
+  )
+) %>%
+  mutate(
+    N_Excluded = c(
+      0,
+      nrow(cohort_step1) - nrow(cohort_step2),
+      nrow(cohort_step2) - nrow(cohort_step3),
+      nrow(cohort_step3) - nrow(cohort_step4),
+      nrow(cohort_step4) - nrow(cohort_step4_with_baseline),
+      nrow(cohort_step4_with_baseline) - nrow(cohort_step4_with_peri),
+      nrow(cohort_step4_with_peri) - nrow(cohort_final)
+    ),
+    Percent_Remaining = (N_Stays / nrow(cohort_step1)) * 100,
+    Step = factor(Step, levels = Step)
+  )
+
+# Create waterfall chart
+p_flow <- ggplot(exclusion_flow, aes(x = Step, y = N_Stays)) +
+  geom_bar(stat = "identity",
+           fill = c("#3498db", "#95a5a6", "#95a5a6", "#95a5a6",
+                    "#95a5a6", "#95a5a6", "#2ecc71"),
+           color = NA,
+           width = 0.7) +
+  geom_text(aes(label = format(N_Stays, big.mark = ",")),
+            vjust = -0.5, size = 4.5, fontface = "bold") +
+  geom_text(aes(label = sprintf("Excluded:\n%s", format(N_Excluded, big.mark = ","))),
+            vjust = 1.5, size = 3, color = "red",
+            data = exclusion_flow %>% filter(N_Excluded > 0)) +
+  geom_text(aes(label = sprintf("(%.1f%%)", Percent_Remaining)),
+            vjust = -2.5, size = 3.5, color = "darkblue") +
+  scale_y_continuous(labels = comma, expand = expansion(mult = c(0, 0.18))) +
+  labs(
+    title = "Cohort Selection Flow — v2: Imputed Baseline Creatinine",
+    subtitle = sprintf("From %s to %s ICU stays (%.1f%% retained) | Missing baseline Cr imputed via CKD-EPI 2021 at GFR=90",
+                      format(nrow(cohort_step1), big.mark = ","),
+                      format(nrow(cohort_final), big.mark = ","),
+                      (nrow(cohort_final) / nrow(cohort_step1)) * 100),
+    x = NULL,
+    y = "Number of ICU Stays"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+    plot.subtitle = element_text(size = 10, hjust = 0.5),
+    axis.text.x = element_text(angle = 35, hjust = 1, vjust = 1, size = 9),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    plot.margin = margin(t = 5, r = 10, b = 20, l = 10)
+  )
+
+print(p_flow)
+ggsave("exclusion_flow_diagram_v2_imputed.png", p_flow, width = 10, height = 7, dpi = 300)
+```
+
+### 2. Imputed vs Observed Baseline Creatinine Distribution
+```{r baseline-source-viz, fig.width=10, fig.height=5}
+final_with_aki_stage %>%
+  ggplot(aes(x = baseline_creat, fill = baseline_source)) +
+  geom_histogram(bins = 50, alpha = 0.7, color = "white", linewidth = 0.2,
+                 position = "identity") +
+  scale_fill_manual(values = c("observed" = "#3498db", "imputed" = "#e67e22"),
+                    labels = c("observed" = "Observed (measured lab)",
+                               "imputed"  = "Imputed (CKD-EPI at GFR=90)")) +
+  scale_x_continuous(limits = c(0, 3), breaks = seq(0, 3, 0.5)) +
+  labs(
+    title = "Baseline Creatinine Distribution by Source",
+    subtitle = sprintf("Final cohort: %s stays (%s observed, %s imputed)",
+                      format(nrow(final_with_aki_stage), big.mark = ","),
+                      format(sum(final_with_aki_stage$baseline_source == "observed",
+                                 na.rm = TRUE), big.mark = ","),
+                      format(sum(final_with_aki_stage$baseline_source == "imputed",
+                                 na.rm = TRUE), big.mark = ",")),
+    x = "Baseline Creatinine (mg/dL)",
+    y = "Count",
+    fill = "Source"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    legend.position = "bottom"
+  )
+```
+
+## Saving Intermediate Datasets
+```{r}
+# Save baseline creatinine data (includes baseline_source column)
+saveRDS(baseline_creatinine, "baseline_creatinine_imputed.rds")
+cat("baseline_creatinine_imputed.rds\n")
+
+# Save AKI staging data
+saveRDS(aki_at_intubation, "aki_staging_at_intubation_imputed.rds")
+cat("aki_staging_at_intubation_imputed.rds\n")
+
+# Save exclusion lists
+exclusion_lists_v2 <- list(
+  esrd_patients = esrd_patients,
+  stays_with_aki_stage2_plus = stays_with_aki_stage2_plus
+)
+saveRDS(exclusion_lists_v2, "exclusion_patient_lists_v2_imputed.rds")
+cat("exclusion_patient_lists_v2_imputed.rds\n")
+
+cat(sprintf("\nFinal cohort: %s ICU stays from %s patients\n",
+            format(nrow(cohort), big.mark = ","),
+            format(n_distinct(cohort$subject_id), big.mark = ",")))
+cat("Baseline method: Observed median Cr 7-365d OR CKD-EPI 2021 imputed at GFR=90\n")
+cat(sprintf("  Observed: %s | Imputed: %s\n",
+            format(sum(baseline_creatinine$baseline_source == "observed"), big.mark=","),
+            format(sum(baseline_creatinine$baseline_source == "imputed"), big.mark=",")))
+```

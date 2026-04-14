@@ -1,0 +1,575 @@
+---
+title: "AKI Prediction — SHAP Analysis"
+subtitle: "BIOSTAT 203B Final Project"
+author: "Rica Pitogo"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: hide
+    fig_width: 10
+    fig_height: 7
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  cache   = FALSE,
+  fig.width  = 10,
+  fig.height = 7
+)
+```
+
+## Overview
+
+This notebook computes and visualizes **SHAP (SHapley Additive exPlanations)** values for the fitted ML models predicting **AKI Stage 2+ within 7 days of mechanical ventilation**. SHAP quantifies the marginal contribution of each feature to individual predictions, enabling both global feature importance and local patient-level interpretation.
+
+This analysis focuses on the three highest-performing models — **Logistic Regression**, **XGBoost**, and **LASSO** — which achieved nearly identical AUROC values (~0.800). XGBoost SHAP values are computed using exact TreeSHAP via `shapviz`. Logistic Regression and LASSO are interpreted via pooled coefficients. Random Forest and SVM are excluded: RF SHAP is computationally prohibitive via Monte Carlo approximation, and SVM does not support tractable SHAP computation with an RBF kernel.
+
+---
+
+## 1. Libraries and Setup
+
+```{r libraries}
+# Check/install required packages
+pkgs_needed <- c("shapviz", "DALEX")
+new_pkgs <- pkgs_needed[!pkgs_needed %in% installed.packages()[, "Package"]]
+if (length(new_pkgs) > 0) {
+  message("Installing: ", paste(new_pkgs, collapse = ", "))
+  install.packages(new_pkgs, dependencies = TRUE)
+}
+
+library(tidyverse)
+library(tidymodels)
+library(xgboost)
+library(ranger)
+library(glmnet)
+library(shapviz)
+library(patchwork)
+library(knitr)
+library(scales)
+
+tidymodels_prefer()
+set.seed(203)
+```
+
+---
+
+## 2. Load Data and Reproduce Train/Test Split
+
+This section **exactly replicates** the data preparation and split logic from `04_machine_learning.Rmd`. The same `set.seed(203)` and `initial_split()` call ensures test patients match `ml_predictions_pooled.rds`.
+
+```{r load-data}
+stacked <- readRDS("feature_matrix_imputed_stacked.rds")
+fitted  <- readRDS("ml_fitted_models.rds")
+
+cat("Stacked data:", nrow(stacked), "rows x", ncol(stacked), "cols\n")
+cat("Models loaded:", paste(names(fitted), collapse = ", "), "\n")
+cat("Imputations per model:", length(fitted$xgb), "\n")
+```
+
+```{r define-predictors}
+predictor_cols <- c(
+  "age", "gender", "admission_type",
+  "bicarbonate_mean", "chloride_mean", "glucose_mean", "hematocrit_mean",
+  "hemoglobin_mean", "inr_mean", "magnesium_mean", "paco2_mean",
+  "pao2_mean", "ph_mean", "platelet_mean", "potassium_mean",
+  "prothrombin_mean", "ptt_mean", "sodium_mean", "troponin_mean",
+  "wbc_mean", "albumin_mean", "bilirubin_mean", "calcium_mean",
+  "lactate_mean", "phosphate_mean", "fibrinogen_mean", "bnp_mean",
+  "fio2_mean", "gcs_eye_mean", "gcs_motor_mean",
+  "heart_rate_mean", "map_invasive_mean", "map_noninvasive_mean",
+  "peep_set_mean", "peep_total_mean", "plateau_pressure_mean",
+  "resp_rate_obs_mean", "resp_rate_set_mean",
+  "sbp_invasive_mean", "sbp_noninvasive_mean",
+  "spo2_mean", "temp_f_mean", "tidal_vol_obs_mean", "tidal_vol_set_mean",
+  "peep_mean", "driving_pressure_mean", "map_mean", "gcs_total_mean",
+  "total_fluid_in_24h", "total_fluid_out_24h", "fluid_balance_24h",
+  "vasopressor_24h", "vasopressor_hours_24h", "vaso_dose_221906", 
+  "vaso_dose_221289", "vaso_dose_221653", "vaso_dose_221662",
+  "height_cm", "weight_kg",
+  "dm", "htn", "ckd", "copd", "hf", "cad", "sepsis",
+  "race", "bmi", "pf_ratio",
+  "sofa_resp", "sofa_coag", "sofa_liver", "sofa_cardio", "sofa_neuro"
+)
+predictor_cols <- intersect(predictor_cols, names(stacked))
+```
+
+```{r prepare-data}
+race_levels <- c("White", "Black", "Hispanic", "Asian", "Other/Unknown")
+
+stacked_clean <- stacked |>
+  filter(!is.na(aki_stage2_7d)) |>
+  mutate(
+    aki_stage2_7d = factor(aki_stage2_7d, levels = c(1, 0), 
+                           labels = c("AKI", "No_AKI")),
+    gender = factor(gender, levels = c("M", "F")),
+    admission_type = factor(admission_type),
+    race = factor(race, levels = race_levels),
+    across(c(dm, htn, ckd, copd, hf, cad, sepsis, vasopressor_24h), as.integer)
+  ) |>
+  select(stay_id, .imp, aki_stage2_7d, all_of(predictor_cols))
+
+cat("Rows:", nrow(stacked_clean), "| Unique stay_ids:", 
+    n_distinct(stacked_clean$stay_id), "\n")
+```
+
+```{r train-test-split}
+set.seed(203)
+
+stay_outcomes <- stacked_clean |>
+  filter(.imp == 1) |>
+  select(stay_id, aki_stage2_7d)
+
+split_ids <- initial_split(stay_outcomes, prop = 0.80, strata = aki_stage2_7d)
+train_ids <- training(split_ids) |> pull(stay_id)
+test_ids <- testing(split_ids)  |> pull(stay_id)
+
+train_stack <- stacked_clean |> filter(stay_id %in% train_ids)
+test_stack <- stacked_clean |> filter(stay_id %in% test_ids)
+
+stopifnot(nrow(test_stack) == length(test_ids) * 5)
+stopifnot(length(intersect(train_ids, test_ids)) == 0)
+
+cat("Test patients:", length(test_ids), "| Test rows:", nrow(test_stack), "\n")
+cat("Train patients:", length(train_ids), "| Train rows:", 
+    nrow(train_stack), "\n")
+
+# Validate split matches saved predictions
+ml_preds <- readRDS("ml_predictions_pooled.rds")
+saved_test_ids <- ml_preds |> filter(model == "XGBoost") |> pull(stay_id)
+stopifnot(setequal(test_ids, saved_test_ids))
+cat("Split validation: test IDs match ml_predictions_pooled.rds\n")
+```
+
+---
+
+## 3. Prepare Baked Feature Matrices
+
+Extract the prepped recipe from each fitted workflow and bake the test/train data.
+
+```{r bake-helper}
+bake_data <- function(workflow_fit, raw_data) {
+  recipe_prepped <- extract_recipe(workflow_fit)
+  bake(recipe_prepped, new_data = raw_data) |>
+    select(-aki_stage2_7d)
+}
+
+# Bake test data for each XGBoost imputation (tree recipe: no normalization)
+test_baked_xgb <- map(1:5, function(i) {
+  raw <- test_stack |> filter(.imp == i) |> select(-stay_id, -.imp)
+  bake_data(fitted$xgb[[i]], raw)
+})
+
+# Bake train data for imputation 1 (used as SHAP background)
+train_imp1_raw <- train_stack |> filter(.imp == 1) |> select(-stay_id, -.imp)
+train_baked_xgb <- bake_data(fitted$xgb[[1]], train_imp1_raw)
+
+cat("Baked test features (XGBoost, imp1):", ncol(test_baked_xgb[[1]]), 
+    "columns\n")
+cat("Test rows per imputation:", nrow(test_baked_xgb[[1]]), "\n")
+```
+
+---
+
+## 4. XGBoost SHAP — Exact TreeSHAP
+
+XGBoost natively supports exact TreeSHAP computation via the `shapviz` package. This extracts the raw `xgb.Booster` from each fitted tidymodels workflow and computes SHAP values directly, without approximation.
+
+### 4.1 Compute SHAP per Imputation
+
+```{r xgb-shap-compute}
+xgb_shap_list <- map(1:5, function(i) {
+  # Extract raw xgb.Booster from tidymodels workflow
+  xgb_booster <- extract_fit_parsnip(fitted$xgb[[i]])$fit
+
+  # Convert baked data to plain numeric matrix (required by shapviz)
+  X_matrix <- test_baked_xgb[[i]] |> as.matrix()
+
+  # shapviz computes exact TreeSHAP internally via xgb predict
+  sv <- shapviz(xgb_booster, X_pred = X_matrix)
+
+  list(
+    S = sv$S,         
+    baseline = sv$baseline    
+  )
+})
+
+cat("SHAP matrix dimensions (imp1):",
+    nrow(xgb_shap_list[[1]]$S), "x", ncol(xgb_shap_list[[1]]$S), "\n")
+cat("Baselines across 5 imputations:",
+    round(sapply(xgb_shap_list, `[[`, "baseline"), 4), "\n")
+```
+
+### 4.2 Pool SHAP Values Across Imputations (Rubin's Rule)
+
+```{r xgb-shap-pool}
+# Average SHAP matrices: element-wise mean across 5 imputations
+xgb_shap_pooled <- Reduce("+", lapply(xgb_shap_list, `[[`, "S")) / 5
+xgb_baseline_pooled <- mean(sapply(xgb_shap_list, `[[`, "baseline"))
+
+cat("Pooled SHAP matrix:", nrow(xgb_shap_pooled), "patients x",
+    ncol(xgb_shap_pooled), "features\n")
+cat("Pooled baseline (expected value):", round(xgb_baseline_pooled, 4),
+    "≈", round(xgb_baseline_pooled * 100, 1), "% AKI prevalence\n")
+
+# Build shapviz object from pooled SHAP matrix
+# Use imputation 1 feature values for display in dependence/waterfall plots
+sv_xgb <- shapviz(
+  object   = xgb_shap_pooled,
+  X        = test_baked_xgb[[1]],
+  baseline = xgb_baseline_pooled
+)
+```
+
+### 4.3 Figure 1: SHAP Beeswarm Summary Plot (Top 20 Features)
+
+Each row = one feature; each dot = one test patient. The x-axis shows the SHAP value (contribution to log-odds of AKI), colored by the feature's value (red = high, blue = low). Features are ordered by mean |SHAP| from top to bottom.
+
+```{r fig-xgb-beeswarm, fig.height=9, fig.width=10}
+sv_importance(sv_xgb, kind = "beeswarm", max_display = 20) +
+  labs(
+    title = "XGBoost: SHAP Values — AKI Stage 2+ Prediction",
+    subtitle = paste0(
+      "Top 20 features by mean |SHAP|; pooled across 5 MICE imputations (",
+      length(test_ids), " test patients)"
+    ),
+    x = "SHAP value (log-odds contribution to P(AKI Stage 2+))"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+### 4.4 Figure 2: SHAP Importance Bar Plot (Top 25 Features)
+
+```{r fig-xgb-importance-bar, fig.height=8, fig.width=9}
+sv_importance(sv_xgb, kind = "bar", max_display = 25) +
+  labs(
+    title = "XGBoost: Mean |SHAP| Feature Importance",
+    subtitle = "Pooled across 5 MICE imputations; higher = stronger predictor",
+    x = "Mean |SHAP Value|",
+    y = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+### 4.5 Figure 3: SHAP Dependence Plots — Top 5 Features
+
+For each of the top 5 features, shows the relationship between the feature value and its SHAP contribution, colored by the automatically selected interaction variable (highest SHAP interaction strength).
+
+```{r fig-xgb-dependence, fig.height=12, fig.width=11}
+# Identify top 5 features by mean |SHAP|
+top5_features <- colMeans(abs(xgb_shap_pooled)) |>
+  sort(decreasing = TRUE) |>
+  head(5) |>
+  names()
+
+cat("Top 5 features by mean |SHAP|:\n")
+print(top5_features)
+
+dep_plots <- map(top5_features, function(feat) {
+  sv_dependence(sv_xgb, v = feat, color_var = "auto") +
+    labs(title = feat) +
+    theme_minimal(base_size = 10)
+})
+
+wrap_plots(dep_plots, ncol = 2) +
+  plot_annotation(
+    title = "XGBoost: SHAP Dependence Plots — Top 5 Features",
+    subtitle = "Color = automatically selected interaction variable (max SHAP interaction strength)",
+    theme = theme(
+      plot.title = element_text(face = "bold", size = 14),
+      plot.subtitle = element_text(size = 11)
+    )
+  )
+```
+
+### 4.6 Figure 4: Waterfall Plots — Representative Patients
+
+Waterfall plots decompose a single patient's predicted probability into the contribution of each feature, starting from the expected value (baseline ≈ AKI prevalence). Four representative cases are shown.
+
+```{r identify-representative-patients}
+# Load pooled predictions to identify representative patients
+test_true <- test_stack |>
+  filter(.imp == 1) |>
+  select(stay_id, aki_stage2_7d)
+
+preds_xgb <- ml_preds |>
+  filter(model == "XGBoost") |>
+  select(stay_id, .pred_AKI) |>
+  left_join(test_true, by = "stay_id")
+
+# Test patient row order in test_baked_xgb[[1]] matches test_stack filter
+test_order <- test_stack |>
+  filter(.imp == 1) |>
+  pull(stay_id)
+
+# Find row indices for representative patients
+get_row_idx <- function(target_stay_id) {
+  which(test_order == target_stay_id)
+}
+
+tp_stay <- preds_xgb |>
+  filter(aki_stage2_7d == "AKI") |>
+  slice_max(.pred_AKI, n = 1) |>
+  pull(stay_id)
+
+tn_stay <- preds_xgb |>
+  filter(aki_stage2_7d == "No_AKI") |>
+  slice_min(.pred_AKI, n = 1) |>
+  pull(stay_id)
+
+fp_stay <- preds_xgb |>
+  filter(aki_stage2_7d == "No_AKI") |>
+  slice_max(.pred_AKI, n = 1) |>
+  pull(stay_id)
+
+fn_stay <- preds_xgb |>
+  filter(aki_stage2_7d == "AKI") |>
+  slice_min(.pred_AKI, n = 1) |>
+  pull(stay_id)
+
+cases <- list(
+  list(id = tp_stay, label = "True Positive (High-Risk AKI)", 
+       outcome = "AKI"),
+  list(id = tn_stay, label = "True Negative (Low-Risk, No AKI)", 
+       outcome = "No_AKI"),
+  list(id = fp_stay, label = "False Positive (High-Risk, No AKI)", 
+       outcome = "No_AKI"),
+  list(id = fn_stay, label = "False Negative (Low-Risk, AKI)", 
+       outcome = "AKI")
+)
+
+for (case in cases) {
+  pred_val <- preds_xgb |> filter(stay_id == case$id) |> pull(.pred_AKI)
+  cat(case$label, "| P(AKI):", round(pred_val, 3), "\n")
+}
+```
+
+```{r fig-xgb-waterfall, fig.height=14, fig.width=12}
+wf_plots <- map(cases, function(case) {
+  row_idx <- get_row_idx(case$id)
+  pred_val <- preds_xgb |> filter(stay_id == case$id) |> pull(.pred_AKI)
+
+  sv_waterfall(sv_xgb, row_id = row_idx, max_display = 12) +
+    labs(
+      title = case$label,
+      subtitle = paste0("Predicted P(AKI) = ", round(pred_val, 3),
+                        " | True = ", case$outcome)
+    ) +
+    theme_minimal(base_size = 10) +
+    theme(plot.title = element_text(face = "bold", size = 11))
+})
+
+wrap_plots(wf_plots, ncol = 2) +
+  plot_annotation(
+    title = "XGBoost: SHAP Waterfall Plots — Representative Patients",
+    subtitle = paste0(
+      "Each bar = feature contribution to log-odds; baseline = E[f(x)] ≈ ",
+      round(xgb_baseline_pooled * 100, 1), "% AKI prevalence"
+    ),
+    theme = theme(
+      plot.title = element_text(face = "bold", size = 14),
+      plot.subtitle = element_text(size = 11)
+    )
+  )
+```
+
+---
+
+## 5. LASSO — Pooled Coefficients
+
+For linear models (LASSO, logistic regression), model coefficients directly represent the direction and relative magnitude of each feature's association with AKI risk. SHAP values for linear models equal the coefficient scaled by the feature deviation from the training mean — the pooled coefficient plot captures this interpretation.
+
+```{r lasso-pooled-coefs}
+lasso_coef_list <- map(1:5, function(i) {
+  extract_fit_parsnip(fitted$lr[[i]]) |>
+    tidy() |>
+    filter(term != "(Intercept)") |>
+    select(term, estimate) |>
+    mutate(.imp = i)
+})
+
+lasso_coefs_pooled <- bind_rows(lasso_coef_list) |>
+  group_by(term) |>
+  summarise(
+    mean_coef = mean(estimate),
+    sd_coef   = sd(estimate),
+    n_nonzero = sum(estimate != 0),
+    .groups   = "drop"
+  ) |>
+  filter(mean_coef != 0) |>
+  arrange(desc(abs(mean_coef)))
+
+cat("Non-zero LASSO predictors (pooled mean ≠ 0):", nrow(lasso_coefs_pooled), 
+    "\n")
+```
+
+### Figure 5: LASSO Pooled Coefficients
+
+```{r fig-lasso-coefs, fig.height=8, fig.width=9}
+lasso_coefs_pooled |>
+  slice_head(n = 30) |>
+  mutate(
+    direction = if_else(mean_coef > 0, "Positive (risk factor)", 
+                        "Negative (protective)"),
+    term = reorder(term, abs(mean_coef))
+  ) |>
+  ggplot(aes(x = mean_coef, y = term, fill = direction)) +
+  geom_col(show.legend = TRUE, width = 0.7) +
+  geom_errorbarh(
+    aes(xmin = mean_coef - sd_coef, xmax = mean_coef + sd_coef),
+    height = 0.25, color = "grey40", linewidth = 0.4
+  ) +
+  scale_fill_manual(
+    values = c("Positive (risk factor)" = "#e74c3c",
+               "Negative (protective)"  = "#3498db"),
+    name = NULL
+  ) +
+  labs(
+    title = "LASSO: Pooled Coefficients Across 5 MICE Imputations",
+    subtitle = "Top 30 non-zero coefficients; error bars = SD across imputations",
+    x  = "Pooled Coefficient (normalized scale)",
+    y  = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    legend.position = "bottom"
+  )
+```
+
+```{r lasso-coef-table}
+lasso_coefs_pooled |>
+  slice_head(n = 20) |>
+  mutate(
+    across(c(mean_coef, sd_coef), \(x) round(x, 4)),
+    pct_nonzero = round(n_nonzero / 5 * 100, 0)
+  ) |>
+  kable(
+    col.names = c("Feature", "Mean Coefficient", "SD", "N Non-Zero", 
+                  "% Non-Zero"),
+    caption = "Table 1: LASSO Top 20 Pooled Coefficients 
+    (pooled across 5 imputations)"
+  )
+```
+
+---
+
+## 6. Logistic Regression — Pooled Coefficients
+
+```{r logit-pooled-coefs}
+logit_coef_list <- map(1:5, function(i) {
+  extract_fit_parsnip(fitted$logit[[i]]) |>
+    tidy() |>
+    filter(term != "(Intercept)") |>
+    select(term, estimate) |>
+    mutate(.imp = i)
+})
+
+logit_coefs_pooled <- bind_rows(logit_coef_list) |>
+  group_by(term) |>
+  summarise(
+    mean_coef = mean(estimate),
+    sd_coef = sd(estimate),
+    .groups = "drop"
+  ) |>
+  arrange(desc(abs(mean_coef)))
+
+cat("Logistic regression predictors:", nrow(logit_coefs_pooled), "\n")
+```
+
+### Figure 6: Logistic Regression Pooled Coefficients
+
+```{r fig-logit-coefs, fig.height=8, fig.width=9}
+logit_coefs_pooled |>
+  slice_head(n = 25) |>
+  mutate(
+    direction = if_else(mean_coef > 0, "Positive (risk factor)", 
+                        "Negative (protective)"),
+    term = reorder(term, abs(mean_coef))
+  ) |>
+  ggplot(aes(x = mean_coef, y = term, fill = direction)) +
+  geom_col(show.legend = TRUE, width = 0.7) +
+  geom_errorbarh(
+    aes(xmin = mean_coef - sd_coef, xmax = mean_coef + sd_coef),
+    height = 0.25, color = "grey40", linewidth = 0.4
+  ) +
+  scale_fill_manual(
+    values = c("Positive (risk factor)" = "#e74c3c",
+               "Negative (protective)"  = "#3498db"),
+    name = NULL
+  ) +
+  labs(
+    title = "Logistic Regression: Pooled Coefficients Across 5 MICE Imputations",
+    subtitle = "Top 25 features; error bars = SD across imputations",
+    x = "Pooled Coefficient (normalized scale)",
+    y = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    legend.position = "bottom"
+  )
+```
+
+---
+
+## 7. Feature Importance Summary Table
+
+Combined ranking of the top 15 features by mean |SHAP| for XGBoost, alongside LASSO and logistic regression coefficient rankings.
+
+```{r summary-table}
+# Build XGBoost importance data frame
+xgb_imp_df <- tibble(
+  feature   = colnames(xgb_shap_pooled),
+  mean_shap = colMeans(abs(xgb_shap_pooled))
+)
+
+# SHAP-based rankings (XGBoost)
+xgb_rank <- xgb_imp_df |>
+  arrange(desc(mean_shap)) |>
+  mutate(xgb_rank = row_number(), xgb_shap = round(mean_shap, 5)) |>
+  select(feature, xgb_rank, xgb_shap)
+
+# Coefficient-based rankings (LASSO and logit)
+lasso_rank <- lasso_coefs_pooled |>
+  arrange(desc(abs(mean_coef))) |>
+  mutate(lasso_rank = row_number()) |>
+  select(feature = term, lasso_rank)
+
+logit_rank <- logit_coefs_pooled |>
+  arrange(desc(abs(mean_coef))) |>
+  mutate(logit_rank = row_number()) |>
+  select(feature = term, logit_rank)
+
+# Top 15 by XGBoost SHAP
+top15 <- xgb_rank |> slice_head(n = 15) |> pull(feature)
+
+summary_table <- xgb_rank |>
+  filter(feature %in% top15) |>
+  left_join(lasso_rank, by = "feature") |>
+  left_join(logit_rank, by = "feature") |>
+  arrange(xgb_rank)
+
+summary_table |>
+  kable(
+    col.names = c("Feature", "XGBoost Rank", "XGBoost Mean|SHAP|",
+                  "LASSO Rank", "Logit Rank"),
+    caption = "Table 2: Feature Importance — Top 15 by XGBoost SHAP (top 3 models)"
+  )
+```
+
+---
+
+## 8. Session Info
+
+```{r session-info}
+sessionInfo()
+```

@@ -1,0 +1,30 @@
+# Data files (MIMIC-IV is restricted-access — never commit)
+*.csv
+*.csv.gz
+*.rds
+*.parquet
+*_parquet/
+*_pq/
+
+# Large/intermediate outputs
+*_cache/
+*_files/
+*.html
+
+# Credentials & tokens
+*.json
+
+# Keep specific images for README
+!images/*.png
+
+# R/Python environment
+.Rproj.user
+.Rhistory
+.RData
+.Rdata
+venv/
+__pycache__/
+
+# OS
+.DS_Store
+Thumbs.db
