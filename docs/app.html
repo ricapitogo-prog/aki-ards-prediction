@@ -1,0 +1,650 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Cohort Explorer — AKI Prediction</title>
+  <link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:wght@400;600;700&family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+  <style>
+    :root {
+      --primary: #1b3a5c;
+      --primary-light: #2d6da3;
+      --bg: #fafbfc;
+      --bg-white: #ffffff;
+      --bg-alt: #f0f3f6;
+      --text: #1a2332;
+      --text-mid: #4a5568;
+      --text-light: #6b7c93;
+      --border: #dce3eb;
+      --border-light: #e8edf2;
+      --radius: 10px;
+      --shadow-sm: 0 1px 3px rgba(27,58,92,0.06);
+      --shadow-md: 0 4px 16px rgba(27,58,92,0.08);
+      --max-w: 1100px;
+      --green: #27ae60;
+      --yellow: #f39c12;
+      --orange: #e67e22;
+      --red: #c0392b;
+    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: 'DM Sans', -apple-system, sans-serif;
+      color: var(--text);
+      line-height: 1.6;
+      background: var(--bg);
+      -webkit-font-smoothing: antialiased;
+    }
+    h1, h2, h3 { font-family: 'Source Serif 4', Georgia, serif; letter-spacing: -0.02em; }
+
+    /* ── Header ─────────────────────────── */
+    .header {
+      background: linear-gradient(145deg, #0f2440, var(--primary));
+      color: #fff;
+      padding: 32px 28px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 16px;
+    }
+    .header h1 { font-size: 1.5rem; font-weight: 700; }
+    .header .back {
+      color: #90c4e8;
+      text-decoration: none;
+      font-size: 0.88rem;
+      font-weight: 500;
+    }
+    .header .back:hover { color: #fff; }
+
+    /* ── Stats bar ──────────────────────── */
+    .stats-bar {
+      background: var(--bg-white);
+      border-bottom: 1px solid var(--border-light);
+      padding: 16px 28px;
+      display: flex;
+      gap: 36px;
+      flex-wrap: wrap;
+      justify-content: center;
+    }
+    .stat-item { text-align: center; }
+    .stat-item .val {
+      font-family: 'Source Serif 4', serif;
+      font-size: 1.5rem;
+      font-weight: 700;
+      color: var(--primary);
+    }
+    .stat-item .lbl {
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      color: var(--text-light);
+    }
+
+    /* ── Layout ─────────────────────────── */
+    .app-container {
+      max-width: var(--max-w);
+      margin: 0 auto;
+      padding: 24px 28px;
+    }
+
+    /* ── Controls ────────────────────────── */
+    .controls {
+      background: var(--bg-white);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px 24px;
+      margin-bottom: 24px;
+      box-shadow: var(--shadow-sm);
+      display: flex;
+      gap: 20px;
+      flex-wrap: wrap;
+      align-items: end;
+    }
+    .control-group { display: flex; flex-direction: column; gap: 4px; }
+    .control-group label {
+      font-size: 0.78rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: var(--text-light);
+    }
+    .control-group select, .control-group input {
+      padding: 8px 12px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      font-size: 0.88rem;
+      font-family: inherit;
+      background: var(--bg);
+      color: var(--text);
+      min-width: 160px;
+    }
+    .control-group select:focus, .control-group input:focus {
+      outline: none;
+      border-color: var(--primary-light);
+      box-shadow: 0 0 0 3px rgba(45,109,163,0.12);
+    }
+    .filter-count {
+      font-size: 0.85rem;
+      color: var(--text-light);
+      margin-left: auto;
+      align-self: center;
+    }
+
+    /* ── Chart grid ─────────────────────── */
+    .chart-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(480px, 1fr));
+      gap: 20px;
+      margin-bottom: 24px;
+    }
+    .chart-card {
+      background: var(--bg-white);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px 24px;
+      box-shadow: var(--shadow-sm);
+    }
+    .chart-card h3 {
+      font-size: 1rem;
+      font-weight: 600;
+      color: var(--primary);
+      margin-bottom: 12px;
+      font-family: 'DM Sans', sans-serif;
+    }
+    .chart-card canvas { max-height: 300px; }
+
+    /* ── Summary table ──────────────────── */
+    .summary-card {
+      background: var(--bg-white);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px 24px;
+      box-shadow: var(--shadow-sm);
+      margin-bottom: 24px;
+      overflow-x: auto;
+    }
+    .summary-card h3 {
+      font-size: 1rem;
+      font-weight: 600;
+      color: var(--primary);
+      margin-bottom: 12px;
+      font-family: 'DM Sans', sans-serif;
+    }
+    .s-tbl {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.85rem;
+    }
+    .s-tbl th {
+      background: var(--primary);
+      color: #fff;
+      padding: 8px 14px;
+      text-align: left;
+      font-weight: 600;
+      font-size: 0.8rem;
+    }
+    .s-tbl td {
+      padding: 7px 14px;
+      border-bottom: 1px solid var(--border-light);
+    }
+    .s-tbl tr:hover { background: #f5f8fb; }
+
+    .loading {
+      text-align: center;
+      padding: 80px 20px;
+      color: var(--text-light);
+      font-size: 1.1rem;
+    }
+
+    .aki-dot {
+      display: inline-block;
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      margin-right: 6px;
+    }
+
+    /* ── Responsive ─────────────────────── */
+    @media (max-width: 768px) {
+      .chart-grid { grid-template-columns: 1fr; }
+      .controls { flex-direction: column; }
+      .filter-count { margin-left: 0; }
+    }
+  </style>
+</head>
+<body>
+
+<div class="header">
+  <div>
+    <a class="back" href="index.html">&larr; Back to Project</a>
+    <h1>Interactive Cohort Explorer</h1>
+  </div>
+</div>
+
+<div class="stats-bar" id="stats-bar">
+  <div class="stat-item"><span class="val" id="s-total">—</span><span class="lbl">Patients Shown</span></div>
+  <div class="stat-item"><span class="val" id="s-aki">—</span><span class="lbl">AKI Incidence</span></div>
+  <div class="stat-item"><span class="val" id="s-age">—</span><span class="lbl">Median Age</span></div>
+  <div class="stat-item"><span class="val" id="s-female">—</span><span class="lbl">Female</span></div>
+</div>
+
+<div class="app-container">
+  <div id="loading" class="loading">Loading cohort data...</div>
+
+  <div id="app-content" style="display:none;">
+
+    <!-- Controls -->
+    <div class="controls">
+      <div class="control-group">
+        <label>AKI Stage</label>
+        <select id="f-aki">
+          <option value="all">All Stages</option>
+          <option value="No AKI">No AKI</option>
+          <option value="Stage 1">Stage 1</option>
+          <option value="Stage 2">Stage 2</option>
+          <option value="Stage 3">Stage 3</option>
+        </select>
+      </div>
+      <div class="control-group">
+        <label>Gender</label>
+        <select id="f-gender">
+          <option value="all">All</option>
+          <option value="Female">Female</option>
+          <option value="Male">Male</option>
+        </select>
+      </div>
+      <div class="control-group">
+        <label>Race / Ethnicity</label>
+        <select id="f-race">
+          <option value="all">All</option>
+          <option value="White">White</option>
+          <option value="Black">Black</option>
+          <option value="Hispanic">Hispanic</option>
+          <option value="Asian">Asian</option>
+          <option value="Other/Unknown">Other/Unknown</option>
+        </select>
+      </div>
+      <div class="control-group">
+        <label>Age Range</label>
+        <div style="display:flex;gap:6px;align-items:center;">
+          <input type="number" id="f-age-min" value="18" min="18" max="100" style="width:70px;">
+          <span style="color:var(--text-light);">–</span>
+          <input type="number" id="f-age-max" value="100" min="18" max="100" style="width:70px;">
+        </div>
+      </div>
+      <span class="filter-count" id="filter-count"></span>
+    </div>
+
+    <!-- Charts row 1: AKI distribution + Age histogram -->
+    <div class="chart-grid">
+      <div class="chart-card">
+        <h3>AKI Stage Distribution</h3>
+        <canvas id="chart-aki"></canvas>
+      </div>
+      <div class="chart-card">
+        <h3>Age Distribution</h3>
+        <canvas id="chart-age"></canvas>
+      </div>
+    </div>
+
+    <!-- Charts row 2: Labs + Vitals -->
+    <div class="chart-grid">
+      <div class="chart-card">
+        <h3>Laboratory Values (Median)</h3>
+        <canvas id="chart-labs"></canvas>
+      </div>
+      <div class="chart-card">
+        <h3>Vital Signs (Median)</h3>
+        <canvas id="chart-vitals"></canvas>
+      </div>
+    </div>
+
+    <!-- Charts row 3: Race + Gender breakdown -->
+    <div class="chart-grid">
+      <div class="chart-card">
+        <h3>Race / Ethnicity</h3>
+        <canvas id="chart-race"></canvas>
+      </div>
+      <div class="chart-card">
+        <h3>Gender Distribution</h3>
+        <canvas id="chart-gender"></canvas>
+      </div>
+    </div>
+
+    <!-- Summary table -->
+    <div class="summary-card">
+      <h3>Cohort Summary by AKI Stage</h3>
+      <table class="s-tbl" id="summary-table">
+        <thead>
+          <tr>
+            <th>AKI Stage</th>
+            <th>N</th>
+            <th>%</th>
+            <th>Median Age</th>
+            <th>Female %</th>
+            <th>Creatinine</th>
+            <th>Lactate</th>
+            <th>Heart Rate</th>
+            <th>MAP</th>
+          </tr>
+        </thead>
+        <tbody id="summary-tbody"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<script>
+const AKI_COLORS = {
+  'No AKI': '#27ae60',
+  'Stage 1': '#f39c12',
+  'Stage 2': '#e67e22',
+  'Stage 3': '#c0392b'
+};
+const AKI_ORDER = ['No AKI', 'Stage 1', 'Stage 2', 'Stage 3'];
+
+let DATA = null;
+let charts = {};
+
+// ── Load data ─────────────────────────────────────────────
+fetch('assets/app_data.json')
+  .then(r => r.json())
+  .then(d => {
+    DATA = d;
+    document.getElementById('loading').style.display = 'none';
+    document.getElementById('app-content').style.display = 'block';
+    initCharts();
+    update();
+    // Bind filter events
+    ['f-aki','f-gender','f-race'].forEach(id =>
+      document.getElementById(id).addEventListener('change', update));
+    ['f-age-min','f-age-max'].forEach(id =>
+      document.getElementById(id).addEventListener('input', update));
+  })
+  .catch(e => {
+    document.getElementById('loading').innerHTML =
+      '<p style="color:#c0392b;">Failed to load data. Run <code>export_app_data.R</code> first.</p>';
+  });
+
+// ── Filter patients ───────────────────────────────────────
+function getFiltered() {
+  const aki = document.getElementById('f-aki').value;
+  const gender = document.getElementById('f-gender').value;
+  const race = document.getElementById('f-race').value;
+  const ageMin = +document.getElementById('f-age-min').value || 18;
+  const ageMax = +document.getElementById('f-age-max').value || 100;
+
+  return DATA.patients.filter(p => {
+    if (aki !== 'all' && p.aki_label !== aki) return false;
+    if (gender !== 'all' && p.gender !== gender) return false;
+    if (race !== 'all' && p.race !== race) return false;
+    if (p.age < ageMin || p.age > ageMax) return false;
+    return true;
+  });
+}
+
+// ── Update everything ─────────────────────────────────────
+function update() {
+  const pts = getFiltered();
+  updateStats(pts);
+  updateAKIChart(pts);
+  updateAgeChart(pts);
+  updateLabsChart(pts);
+  updateVitalsChart(pts);
+  updateRaceChart(pts);
+  updateGenderChart(pts);
+  updateTable(pts);
+}
+
+// ── Stats bar ─────────────────────────────────────────────
+function updateStats(pts) {
+  const n = pts.length;
+  const nAki = pts.filter(p => p.aki_label !== 'No AKI').length;
+  const ages = pts.map(p => p.age).filter(a => a != null).sort((a,b) => a-b);
+  const medAge = ages.length ? ages[Math.floor(ages.length/2)] : '—';
+  const pctF = n ? (pts.filter(p => p.gender === 'Female').length / n * 100).toFixed(1) : '—';
+
+  document.getElementById('s-total').textContent = n.toLocaleString();
+  document.getElementById('s-aki').textContent = n ? (nAki/n*100).toFixed(1) + '%' : '—';
+  document.getElementById('s-age').textContent = medAge;
+  document.getElementById('s-female').textContent = pctF + '%';
+  document.getElementById('filter-count').textContent =
+    `Showing ${n.toLocaleString()} of ${DATA.patients.length.toLocaleString()} patients`;
+}
+
+// ── Chart helpers ─────────────────────────────────────────
+function makeOrUpdate(id, config) {
+  if (charts[id]) charts[id].destroy();
+  charts[id] = new Chart(document.getElementById(id), config);
+}
+
+// ── AKI bar chart ─────────────────────────────────────────
+function updateAKIChart(pts) {
+  const counts = {};
+  AKI_ORDER.forEach(s => counts[s] = 0);
+  pts.forEach(p => { if (counts[p.aki_label] !== undefined) counts[p.aki_label]++; });
+  const total = pts.length || 1;
+
+  makeOrUpdate('chart-aki', {
+    type: 'bar',
+    data: {
+      labels: AKI_ORDER,
+      datasets: [{
+        data: AKI_ORDER.map(s => counts[s]),
+        backgroundColor: AKI_ORDER.map(s => AKI_COLORS[s]),
+        borderRadius: 4,
+        barPercentage: 0.65
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: true,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: {
+            label: ctx => `${ctx.raw.toLocaleString()} (${(ctx.raw/total*100).toFixed(1)}%)`
+          }
+        }
+      },
+      scales: {
+        y: { beginAtZero: true, grid: { color: '#eee' } },
+        x: { grid: { display: false } }
+      }
+    }
+  });
+}
+
+// ── Age histogram ─────────────────────────────────────────
+function updateAgeChart(pts) {
+  const bins = Array(17).fill(0); // 18-19, 20-24, 25-29, ..., 95-100
+  const labels = [];
+  for (let i = 0; i < 17; i++) {
+    const lo = 18 + i * 5;
+    const hi = lo + 4;
+    labels.push(`${lo}-${hi}`);
+  }
+  pts.forEach(p => {
+    if (p.age == null) return;
+    const idx = Math.min(Math.floor((p.age - 18) / 5), 16);
+    if (idx >= 0) bins[idx]++;
+  });
+
+  makeOrUpdate('chart-age', {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: [{
+        data: bins,
+        backgroundColor: '#2d6da3',
+        borderRadius: 3,
+        barPercentage: 0.9
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: true,
+      plugins: { legend: { display: false } },
+      scales: {
+        y: { beginAtZero: true, grid: { color: '#eee' } },
+        x: { grid: { display: false }, ticks: { maxRotation: 45 } }
+      }
+    }
+  });
+}
+
+// ── Labs grouped bar by AKI stage ─────────────────────────
+function updateLabsChart(pts) {
+  const labKeys = ['creatinine_mean', 'albumin_mean', 'lactate_mean',
+                    'sodium_mean', 'potassium_mean', 'glucose_mean'];
+  const labLabels = ['Creatinine', 'Albumin', 'Lactate', 'Sodium', 'Potassium', 'Glucose'];
+
+  // Normalize each lab to 0-1 scale for visual comparison
+  const datasets = AKI_ORDER.map(stage => {
+    const stagePts = pts.filter(p => p.aki_label === stage);
+    return {
+      label: stage,
+      data: labKeys.map(k => {
+        const vals = stagePts.map(p => p[k]).filter(v => v != null);
+        return vals.length ? +(vals.reduce((a,b) => a+b, 0) / vals.length).toFixed(2) : null;
+      }),
+      backgroundColor: AKI_COLORS[stage] + 'cc',
+      borderRadius: 3,
+      barPercentage: 0.8
+    };
+  });
+
+  makeOrUpdate('chart-labs', {
+    type: 'bar',
+    data: { labels: labLabels, datasets },
+    options: {
+      responsive: true,
+      maintainAspectRatio: true,
+      plugins: {
+        legend: { position: 'top', labels: { boxWidth: 12, font: { size: 11 } } },
+        tooltip: { callbacks: { label: ctx => `${ctx.dataset.label}: ${ctx.raw}` } }
+      },
+      scales: {
+        y: { beginAtZero: true, grid: { color: '#eee' } },
+        x: { grid: { display: false } }
+      }
+    }
+  });
+}
+
+// ── Vitals grouped bar ────────────────────────────────────
+function updateVitalsChart(pts) {
+  const vKeys = ['heart_rate_mean', 'sbp_noninvasive_mean', 'spo2_mean'];
+  const vLabels = ['Heart Rate', 'Systolic BP', 'SpO2'];
+
+  const datasets = AKI_ORDER.map(stage => {
+    const stagePts = pts.filter(p => p.aki_label === stage);
+    return {
+      label: stage,
+      data: vKeys.map(k => {
+        const vals = stagePts.map(p => p[k]).filter(v => v != null);
+        return vals.length ? +(vals.reduce((a,b) => a+b, 0) / vals.length).toFixed(1) : null;
+      }),
+      backgroundColor: AKI_COLORS[stage] + 'cc',
+      borderRadius: 3,
+      barPercentage: 0.8
+    };
+  });
+
+  makeOrUpdate('chart-vitals', {
+    type: 'bar',
+    data: { labels: vLabels, datasets },
+    options: {
+      responsive: true,
+      maintainAspectRatio: true,
+      plugins: {
+        legend: { position: 'top', labels: { boxWidth: 12, font: { size: 11 } } }
+      },
+      scales: {
+        y: { beginAtZero: false, grid: { color: '#eee' } },
+        x: { grid: { display: false } }
+      }
+    }
+  });
+}
+
+// ── Race doughnut ─────────────────────────────────────────
+function updateRaceChart(pts) {
+  const races = ['White', 'Black', 'Hispanic', 'Asian', 'Other/Unknown'];
+  const raceColors = ['#3498db', '#2ecc71', '#e67e22', '#9b59b6', '#95a5a6'];
+  const counts = races.map(r => pts.filter(p => p.race === r).length);
+
+  makeOrUpdate('chart-race', {
+    type: 'doughnut',
+    data: {
+      labels: races,
+      datasets: [{ data: counts, backgroundColor: raceColors, borderWidth: 2, borderColor: '#fff' }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: true,
+      plugins: {
+        legend: { position: 'right', labels: { boxWidth: 12, font: { size: 11 } } }
+      }
+    }
+  });
+}
+
+// ── Gender doughnut ───────────────────────────────────────
+function updateGenderChart(pts) {
+  const genders = ['Female', 'Male'];
+  const counts = genders.map(g => pts.filter(p => p.gender === g).length);
+
+  makeOrUpdate('chart-gender', {
+    type: 'doughnut',
+    data: {
+      labels: genders,
+      datasets: [{ data: counts, backgroundColor: ['#e74c8b', '#3498db'], borderWidth: 2, borderColor: '#fff' }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: true,
+      plugins: {
+        legend: { position: 'right', labels: { boxWidth: 12, font: { size: 11 } } }
+      }
+    }
+  });
+}
+
+// ── Summary table ─────────────────────────────────────────
+function updateTable(pts) {
+  const tbody = document.getElementById('summary-tbody');
+  const rows = AKI_ORDER.map(stage => {
+    const sp = pts.filter(p => p.aki_label === stage);
+    const n = sp.length;
+    const pct = pts.length ? (n / pts.length * 100).toFixed(1) : '0';
+    const ages = sp.map(p => p.age).filter(a => a != null).sort((a,b) => a-b);
+    const medAge = ages.length ? ages[Math.floor(ages.length/2)] : '—';
+    const pctF = n ? (sp.filter(p => p.gender === 'Female').length / n * 100).toFixed(1) : '—';
+
+    const med = (key) => {
+      const v = sp.map(p => p[key]).filter(x => x != null).sort((a,b) => a-b);
+      return v.length ? v[Math.floor(v.length/2)].toFixed(1) : '—';
+    };
+
+    const color = AKI_COLORS[stage];
+    return `<tr>
+      <td><span class="aki-dot" style="background:${color}"></span>${stage}</td>
+      <td>${n.toLocaleString()}</td>
+      <td>${pct}%</td>
+      <td>${medAge}</td>
+      <td>${pctF}%</td>
+      <td>${med('creatinine_mean')}</td>
+      <td>${med('lactate_mean')}</td>
+      <td>${med('heart_rate_mean')}</td>
+      <td>${med('sbp_noninvasive_mean')}</td>
+    </tr>`;
+  });
+  tbody.innerHTML = rows.join('');
+}
+
+function initCharts() { /* Charts created in update() */ }
+</script>
+</body>
+</html>
