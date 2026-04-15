@@ -1,3 +1,5 @@
+**[View Project Website](https://ricapitogo-prog.github.io/aki-ards-prediction/)**
+
 # Predicting Acute Kidney Injury in Mechanically Ventilated ICU Patients
 
 A machine learning pipeline for predicting AKI Stage 2+ within 7 days of mechanical ventilation initiation, built on the [MIMIC-IV v3.1](https://physionet.org/content/mimiciv/3.1/) critical care database.
