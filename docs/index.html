@@ -1,0 +1,640 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AKI Prediction in Mechanically Ventilated ICU Patients</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --primary: #1a365d;
+      --primary-light: #2b6cb0;
+      --accent: #e74c3c;
+      --bg: #ffffff;
+      --bg-alt: #f7fafc;
+      --text: #2d3748;
+      --text-light: #718096;
+      --border: #e2e8f0;
+      --green: #2ecc71;
+      --orange: #f39c12;
+      --red: #e74c3c;
+      --max-width: 1100px;
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+      color: var(--text);
+      line-height: 1.7;
+      background: var(--bg);
+    }
+
+    /* ── Hero ─────────────────────────────────── */
+    .hero {
+      background: linear-gradient(135deg, var(--primary) 0%, var(--primary-light) 100%);
+      color: white;
+      padding: 80px 24px 60px;
+      text-align: center;
+    }
+    .hero h1 {
+      font-size: 2.4rem;
+      font-weight: 700;
+      margin-bottom: 12px;
+      letter-spacing: -0.5px;
+    }
+    .hero .subtitle {
+      font-size: 1.15rem;
+      font-weight: 300;
+      opacity: 0.9;
+      max-width: 700px;
+      margin: 0 auto 32px;
+    }
+    .hero-stats {
+      display: flex;
+      justify-content: center;
+      gap: 48px;
+      flex-wrap: wrap;
+      margin-top: 20px;
+    }
+    .hero-stat {
+      text-align: center;
+    }
+    .hero-stat .number {
+      font-size: 2.2rem;
+      font-weight: 700;
+      display: block;
+    }
+    .hero-stat .label {
+      font-size: 0.85rem;
+      opacity: 0.8;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+    }
+
+    /* ── Nav ──────────────────────────────────── */
+    .nav {
+      position: sticky;
+      top: 0;
+      background: white;
+      border-bottom: 1px solid var(--border);
+      z-index: 100;
+      padding: 0 24px;
+    }
+    .nav-inner {
+      max-width: var(--max-width);
+      margin: 0 auto;
+      display: flex;
+      gap: 32px;
+      overflow-x: auto;
+    }
+    .nav a {
+      padding: 14px 4px;
+      text-decoration: none;
+      color: var(--text-light);
+      font-size: 0.9rem;
+      font-weight: 500;
+      white-space: nowrap;
+      border-bottom: 2px solid transparent;
+      transition: all 0.2s;
+    }
+    .nav a:hover, .nav a.active {
+      color: var(--primary);
+      border-bottom-color: var(--primary);
+    }
+
+    /* ── Sections ─────────────────────────────── */
+    .container {
+      max-width: var(--max-width);
+      margin: 0 auto;
+      padding: 0 24px;
+    }
+    section {
+      padding: 64px 0;
+      border-bottom: 1px solid var(--border);
+    }
+    section:last-child { border-bottom: none; }
+
+    section h2 {
+      font-size: 1.8rem;
+      font-weight: 700;
+      color: var(--primary);
+      margin-bottom: 8px;
+    }
+    section .section-subtitle {
+      color: var(--text-light);
+      font-size: 1rem;
+      margin-bottom: 32px;
+    }
+    section p {
+      margin-bottom: 16px;
+      font-size: 1rem;
+    }
+
+    /* ── Cards ─────────────────────────────────── */
+    .card-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+      gap: 20px;
+      margin: 24px 0;
+    }
+    .card {
+      background: var(--bg-alt);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 24px;
+    }
+    .card h3 {
+      font-size: 1rem;
+      font-weight: 600;
+      margin-bottom: 8px;
+      color: var(--primary);
+    }
+    .card p {
+      font-size: 0.9rem;
+      color: var(--text-light);
+      margin-bottom: 0;
+    }
+
+    /* ── Pipeline ─────────────────────────────── */
+    .pipeline {
+      display: flex;
+      flex-direction: column;
+      gap: 0;
+      margin: 24px 0;
+    }
+    .pipeline-step {
+      display: flex;
+      align-items: flex-start;
+      gap: 20px;
+      padding: 20px 0;
+      border-left: 3px solid var(--border);
+      padding-left: 24px;
+      position: relative;
+    }
+    .pipeline-step::before {
+      content: attr(data-step);
+      position: absolute;
+      left: -16px;
+      width: 30px;
+      height: 30px;
+      background: var(--primary);
+      color: white;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 0.8rem;
+      font-weight: 700;
+    }
+    .pipeline-step h4 {
+      font-weight: 600;
+      margin-bottom: 4px;
+    }
+    .pipeline-step p {
+      font-size: 0.9rem;
+      color: var(--text-light);
+      margin-bottom: 0;
+    }
+    .pipeline-step code {
+      font-size: 0.8rem;
+      background: #edf2f7;
+      padding: 2px 6px;
+      border-radius: 3px;
+      color: var(--primary);
+    }
+
+    /* ── Figures ───────────────────────────────── */
+    .figure {
+      margin: 32px 0;
+      text-align: center;
+    }
+    .figure img {
+      max-width: 100%;
+      border-radius: 6px;
+      box-shadow: 0 2px 12px rgba(0,0,0,0.08);
+    }
+    .figure figcaption {
+      margin-top: 10px;
+      font-size: 0.85rem;
+      color: var(--text-light);
+      font-style: italic;
+    }
+
+    /* ── Table ─────────────────────────────────── */
+    .data-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.9rem;
+      margin: 20px 0;
+    }
+    .data-table th {
+      background: var(--primary);
+      color: white;
+      padding: 12px 16px;
+      text-align: left;
+      font-weight: 600;
+    }
+    .data-table td {
+      padding: 10px 16px;
+      border-bottom: 1px solid var(--border);
+    }
+    .data-table tr:nth-child(even) {
+      background: var(--bg-alt);
+    }
+    .data-table tr:hover {
+      background: #edf2f7;
+    }
+
+    /* ── Badges ────────────────────────────────── */
+    .badge {
+      display: inline-block;
+      padding: 4px 10px;
+      border-radius: 12px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    .badge-r { background: #e8f4fd; color: #2b6cb0; }
+    .badge-ml { background: #fef3cd; color: #856404; }
+    .badge-stats { background: #d4edda; color: #155724; }
+
+    /* ── Footer ────────────────────────────────── */
+    .footer {
+      background: var(--primary);
+      color: white;
+      padding: 40px 24px;
+      text-align: center;
+    }
+    .footer a {
+      color: #90cdf4;
+      text-decoration: none;
+    }
+    .footer a:hover { text-decoration: underline; }
+    .footer p {
+      margin-bottom: 8px;
+      font-size: 0.9rem;
+      opacity: 0.9;
+    }
+
+    /* ── Responsive ────────────────────────────── */
+    @media (max-width: 768px) {
+      .hero h1 { font-size: 1.8rem; }
+      .hero-stats { gap: 24px; }
+      .hero-stat .number { font-size: 1.6rem; }
+      section { padding: 40px 0; }
+      .card-grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+
+<!-- ════════ HERO ════════ -->
+<div class="hero">
+  <h1>Predicting Acute Kidney Injury in<br>Mechanically Ventilated ICU Patients</h1>
+  <p class="subtitle">
+    A machine learning pipeline for early AKI detection using the MIMIC-IV critical care database
+  </p>
+  <div class="hero-stats" id="hero-stats">
+    <div class="hero-stat">
+      <span class="number" id="stat-patients">—</span>
+      <span class="label">ICU Stays</span>
+    </div>
+    <div class="hero-stat">
+      <span class="number">74</span>
+      <span class="label">Predictors</span>
+    </div>
+    <div class="hero-stat">
+      <span class="number">4</span>
+      <span class="label">ML Models</span>
+    </div>
+    <div class="hero-stat">
+      <span class="number" id="stat-aki-pct">—</span>
+      <span class="label">AKI Incidence</span>
+    </div>
+  </div>
+</div>
+
+<!-- ════════ NAV ════════ -->
+<div class="nav">
+  <div class="nav-inner">
+    <a href="#overview">Overview</a>
+    <a href="#pipeline">Pipeline</a>
+    <a href="#cohort">Cohort</a>
+    <a href="#demographics">Demographics</a>
+    <a href="#labs">Labs & Vitals</a>
+    <a href="#models">Model Performance</a>
+    <a href="#shap">Feature Importance</a>
+    <a href="#code">Code & Data</a>
+  </div>
+</div>
+
+<!-- ════════ OVERVIEW ════════ -->
+<section id="overview">
+  <div class="container">
+    <h2>Overview</h2>
+    <p class="section-subtitle">Clinical motivation and study design</p>
+
+    <p>
+      Acute kidney injury (AKI) is a common and serious complication in mechanically ventilated
+      ICU patients, associated with increased mortality, prolonged hospital stays, and long-term
+      renal impairment. Early identification of patients at risk enables timely interventions
+      including fluid management, nephrotoxin avoidance, and early renal consultation.
+    </p>
+    <p>
+      This project builds a complete predictive modeling pipeline — from raw electronic health
+      records to interpretable model outputs — using the
+      <a href="https://physionet.org/content/mimiciv/3.1/" target="_blank">MIMIC-IV v3.1</a>
+      critical care database. The outcome of interest is <strong>AKI Stage 2 or higher</strong>
+      (KDIGO criteria) within 7 days of mechanical ventilation initiation.
+    </p>
+
+    <div class="card-grid">
+      <div class="card">
+        <h3>Data Source</h3>
+        <p>MIMIC-IV v3.1 — 330,000+ hospital admissions from Beth Israel Deaconess Medical Center (2008–2022)</p>
+      </div>
+      <div class="card">
+        <h3>Outcome</h3>
+        <p>AKI Stage 2+ within 7 days of intubation, defined by KDIGO creatinine criteria with imputed baseline</p>
+      </div>
+      <div class="card">
+        <h3>Methods</h3>
+        <p>Logistic regression, random forest, XGBoost, and SVM with MICE imputation across 5 imputed datasets</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ════════ PIPELINE ════════ -->
+<section id="pipeline" style="background: var(--bg-alt);">
+  <div class="container">
+    <h2>Analysis Pipeline</h2>
+    <p class="section-subtitle">Reproducible, end-to-end workflow from raw EHR data to model interpretation</p>
+
+    <div class="pipeline">
+      <div class="pipeline-step" data-step="1">
+        <div>
+          <h4>Cohort Construction</h4>
+          <p>
+            Identify mechanically ventilated patients (≥24h), apply clinical exclusion criteria
+            (ESRD, elective surgery, pediatric), define AKI outcomes using KDIGO staging with
+            CKD-EPI imputed baseline creatinine.
+          </p>
+          <code>01_cohort_construction.Rmd</code>
+          <span class="badge badge-r">R</span>
+          <span class="badge badge-stats">Clinical</span>
+        </div>
+      </div>
+
+      <div class="pipeline-step" data-step="2">
+        <div>
+          <h4>Feature Engineering</h4>
+          <p>
+            Extract 74 candidate predictors from labs (28 categories), vitals, vasopressors,
+            fluid balance, and ICD-coded comorbidities. Derive BMI, P/F ratio, SOFA components,
+            and driving pressure.
+          </p>
+          <code>02_feature_engineering.Rmd</code>
+          <span class="badge badge-r">R</span>
+        </div>
+      </div>
+
+      <div class="pipeline-step" data-step="3">
+        <div>
+          <h4>Multiple Imputation</h4>
+          <p>
+            Characterize missingness patterns across all features. Apply MICE (Multivariate
+            Imputation by Chained Equations) to generate 5 complete datasets with principled
+            uncertainty propagation.
+          </p>
+          <code>03_imputation.Rmd</code>
+          <span class="badge badge-stats">Statistics</span>
+        </div>
+      </div>
+
+      <div class="pipeline-step" data-step="4">
+        <div>
+          <h4>Machine Learning</h4>
+          <p>
+            Train and evaluate logistic regression, random forest, XGBoost, and SVM using
+            tidymodels. Pool predictions across all 5 imputed datasets following Rubin's rules.
+          </p>
+          <code>04_machine_learning.Rmd</code>
+          <span class="badge badge-ml">ML</span>
+        </div>
+      </div>
+
+      <div class="pipeline-step" data-step="5">
+        <div>
+          <h4>Model Interpretation</h4>
+          <p>
+            SHAP-based global and local feature importance for the best-performing model.
+            Identify which clinical variables drive AKI risk predictions.
+          </p>
+          <code>05_feature_analysis.Rmd</code>
+          <span class="badge badge-ml">ML</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ════════ COHORT ════════ -->
+<section id="cohort">
+  <div class="container">
+    <h2>Cohort Construction</h2>
+    <p class="section-subtitle">Systematic exclusion criteria following CONSORT guidelines</p>
+
+    <p>
+      Starting from all ICU admissions with mechanical ventilation ≥24 hours, we applied
+      sequential exclusion criteria to arrive at a clinically homogeneous cohort suitable
+      for AKI prediction modeling.
+    </p>
+
+    <figure class="figure">
+      <img src="assets/exclusion_flow.png" alt="Patient exclusion flow diagram"
+           onerror="this.parentElement.style.display='none'">
+      <figcaption>Figure 1. CONSORT-style exclusion flow diagram</figcaption>
+    </figure>
+
+    <figure class="figure">
+      <img src="assets/aki_distribution.png" alt="AKI stage distribution">
+      <figcaption>Figure 2. Distribution of AKI stages at mechanical ventilation initiation</figcaption>
+    </figure>
+  </div>
+</section>
+
+<!-- ════════ DEMOGRAPHICS ════════ -->
+<section id="demographics" style="background: var(--bg-alt);">
+  <div class="container">
+    <h2>Cohort Demographics</h2>
+    <p class="section-subtitle">Patient characteristics stratified by AKI status</p>
+
+    <figure class="figure">
+      <img src="assets/age_by_aki.png" alt="Age distribution by AKI stage">
+      <figcaption>Figure 3. Age distribution by AKI stage at intubation</figcaption>
+    </figure>
+
+    <div class="card-grid">
+      <figure class="figure">
+        <img src="assets/gender_by_aki.png" alt="AKI by gender">
+        <figcaption>Figure 4. AKI prevalence by gender</figcaption>
+      </figure>
+      <figure class="figure">
+        <img src="assets/race_by_aki.png" alt="AKI by race">
+        <figcaption>Figure 5. AKI prevalence by race/ethnicity</figcaption>
+      </figure>
+    </div>
+  </div>
+</section>
+
+<!-- ════════ LABS & VITALS ════════ -->
+<section id="labs">
+  <div class="container">
+    <h2>Laboratory Values & Vital Signs</h2>
+    <p class="section-subtitle">Clinical measurements stratified by AKI stage</p>
+
+    <figure class="figure">
+      <img src="assets/labs_by_aki.png" alt="Lab values by AKI stage"
+           onerror="this.parentElement.innerHTML='<p style=\'color:#718096;text-align:center\'>Lab plot not available — run generate_site_assets.R with feature matrix data joined to cohort</p>'">
+      <figcaption>Figure 6. Laboratory values by AKI stage (first values within 24h of intubation)</figcaption>
+    </figure>
+
+    <figure class="figure">
+      <img src="assets/vitals_by_aki.png" alt="Vital signs by AKI stage"
+           onerror="this.parentElement.innerHTML='<p style=\'color:#718096;text-align:center\'>Vitals plot not available — run generate_site_assets.R with feature matrix data joined to cohort</p>'">
+      <figcaption>Figure 7. Vital signs by AKI stage</figcaption>
+    </figure>
+  </div>
+</section>
+
+<!-- ════════ MODEL PERFORMANCE ════════ -->
+<section id="models" style="background: var(--bg-alt);">
+  <div class="container">
+    <h2>Model Performance</h2>
+    <p class="section-subtitle">Comparing four machine learning approaches with pooled predictions across 5 MICE imputations</p>
+
+    <figure class="figure">
+      <img src="assets/model_performance.png" alt="Model AUROC comparison"
+           onerror="this.parentElement.style.display='none'">
+      <figcaption>Figure 8. AUROC comparison across models</figcaption>
+    </figure>
+
+    <!-- Performance table gets inserted here by the R script, or manually -->
+    <div id="perf-table-container">
+      <p><em>Performance table will appear here after running <code>generate_site_assets.R</code>.
+      You can also paste the table from <code>ml_performance_table.csv</code> directly.</em></p>
+    </div>
+  </div>
+</section>
+
+<!-- ════════ SHAP ════════ -->
+<section id="shap">
+  <div class="container">
+    <h2>Feature Importance</h2>
+    <p class="section-subtitle">SHAP-based interpretation of the best-performing model</p>
+
+    <p>
+      SHAP (SHapley Additive exPlanations) values provide both global feature rankings
+      and patient-level explanations for each prediction. This helps clinicians understand
+      which variables drive AKI risk and build trust in model predictions.
+    </p>
+
+    <figure class="figure">
+      <img src="assets/shap_importance.png" alt="SHAP feature importance"
+           onerror="this.innerHTML='<p style=\'color:#718096;text-align:center;padding:40px\'>SHAP plot not available — run 05_feature_analysis.Rmd and save the importance plot as assets/shap_importance.png</p>'">
+      <figcaption>Figure 9. Top 15 features by mean |SHAP| value</figcaption>
+    </figure>
+  </div>
+</section>
+
+<!-- ════════ CODE & DATA ════════ -->
+<section id="code" style="background: var(--bg-alt);">
+  <div class="container">
+    <h2>Code & Data</h2>
+    <p class="section-subtitle">Fully reproducible pipeline</p>
+
+    <div class="card-grid">
+      <div class="card">
+        <h3>Source Code</h3>
+        <p>
+          Full analysis pipeline available on
+          <a href="https://github.com/ricapitogo-prog/aki-ards-prediction" target="_blank">GitHub</a>.
+          All scripts are documented R Markdown files that can be rendered with knitr.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Data Access</h3>
+        <p>
+          This project uses <a href="https://physionet.org/content/mimiciv/3.1/" target="_blank">MIMIC-IV v3.1</a>.
+          Access requires PhysioNet credentialing and a signed data use agreement.
+          No patient data is included in this repository.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Interactive Dashboard</h3>
+        <p>
+          An interactive Shiny app for cohort exploration is included in the repository
+          (<code>shiny_app/</code>). Run locally with <code>shiny::runApp()</code>.
+        </p>
+      </div>
+    </div>
+
+    <h3 style="margin-top:32px; color: var(--primary);">Requirements</h3>
+    <p>R &ge; 4.5 &nbsp;|&nbsp; Key packages: <code>tidyverse</code>, <code>tidymodels</code>,
+    <code>xgboost</code>, <code>mice</code>, <code>shapviz</code>, <code>teal</code>, <code>shiny</code></p>
+  </div>
+</section>
+
+<!-- ════════ FOOTER ════════ -->
+<div class="footer">
+  <p><strong>Rica Mae Pitogo</strong></p>
+  <p>
+    <a href="https://github.com/ricapitogo-prog" target="_blank">GitHub</a>
+  </p>
+  <p style="font-size:0.8rem; opacity:0.6; margin-top:16px;">
+    Built with MIMIC-IV v3.1 &nbsp;|&nbsp; No patient data included in this repository
+  </p>
+</div>
+
+<!-- ════════ SCRIPTS ════════ -->
+<script>
+  // Load cohort stats from JSON (generated by R script)
+  fetch('assets/cohort_stats.json')
+    .then(r => r.json())
+    .then(d => {
+      document.getElementById('stat-patients').textContent =
+        d.n_patients.toLocaleString();
+      document.getElementById('stat-aki-pct').textContent =
+        d.pct_aki + '%';
+    })
+    .catch(() => {
+      // Fallback: leave dashes
+    });
+
+  // Load performance table HTML if available
+  fetch('assets/ml_performance_table.html')
+    .then(r => r.text())
+    .then(html => {
+      document.getElementById('perf-table-container').innerHTML = html;
+    })
+    .catch(() => {});
+
+  // Sticky nav active state
+  const sections = document.querySelectorAll('section[id]');
+  const navLinks = document.querySelectorAll('.nav a');
+  window.addEventListener('scroll', () => {
+    let current = '';
+    sections.forEach(s => {
+      if (window.scrollY >= s.offsetTop - 80) current = s.id;
+    });
+    navLinks.forEach(a => {
+      a.classList.toggle('active', a.getAttribute('href') === '#' + current);
+    });
+  });
+</script>
+</body>
+</html>

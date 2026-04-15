@@ -10,6 +10,7 @@
 *_cache/
 *_files/
 *.html
+!docs/**
 
 # Credentials & tokens
 *.json
